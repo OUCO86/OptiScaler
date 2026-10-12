@@ -39,10 +39,31 @@ constexpr uint64_t kSlotWaitNs = 250ull * 1000ull * 1000ull;
 struct Bridge
 {
     bool ready = false;
+    bool lost = false;
     std::string failure;
+
+    // The reference drops its bridge after a wait that times out three times in a row, on the
+    // grounds that a queue which will not finish work is a queue that must not be given more.
+    // Ours does the same, for the same reason and for a second one: a wait of a quarter second
+    // in the between slot is a quarter second taken out of every frame after it.
+    uint32_t timeouts = 0;
+
+    // What Vulkan reads out of the shared fences, kept beside what D3D12 reads out of them. If
+    // the two ever disagree, the import did not share the fence at all, and that is a different
+    // failure from a queue that will not run -- which is why both are in the log.
+    uint64_t seenToVk = 0;
+    uint64_t seenFromVk = 0;
 
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
+
+    // Kept and logged, because the host spoofs adapters and a device whose LUID happens to
+    // match while its vendor does not is a device on the other side of a fence import that
+    // the specification requires both UUIDs to agree on. Intel is 0x8086; the card that
+    // enumerates first on this machine is not.
+    uint32_t vendorId = 0;
+    uint32_t deviceId = 0;
+    char deviceName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] {};
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queueFamily = 0;
@@ -62,6 +83,10 @@ struct Bridge
     Microsoft::WRL::ComPtr<ID3D12Fence> fromVk;
     VkSemaphore toVkSem = VK_NULL_HANDLE;
     VkSemaphore fromVkSem = VK_NULL_HANDLE;
+
+    // Taken by name, the way the reference takes it: the import is not in the loader's static
+    // table on every driver that has it.
+    PFN_vkImportSemaphoreWin32HandleKHR importSemaphore = nullptr;
 };
 
 inline Bridge& TheBridge()
@@ -70,25 +95,53 @@ inline Bridge& TheBridge()
     return b;
 }
 
-// A shared D3D12 fence as a timeline semaphore. Verbatim from the probe that measured this on
-// this adapter: the semaphore type and the import go in one create, and the handle is closed
-// once the semaphore owns it.
-inline VkSemaphore ImportFence(VkDevice device, HANDLE handle)
+// A shared D3D12 fence as a timeline semaphore, in the reference's own two steps: ask whether
+// the driver can import one at all, create the semaphore as a timeline, then import the handle
+// into it. One create with the import chained onto it is legal too, and it is what this had
+// before; the reference separates them, and on a driver where they differ, the reference's is
+// the one that has run in a game.
+inline VkSemaphore ImportFence(HANDLE handle, std::string& why)
 {
+    Bridge& b = TheBridge();
+
     VkSemaphoreTypeCreateInfo type { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
     type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-    type.initialValue = 0;
+
+    VkPhysicalDeviceExternalSemaphoreInfo info { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO };
+    info.pNext = &type;
+    info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+
+    VkExternalSemaphoreProperties props { VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
+    vkGetPhysicalDeviceExternalSemaphoreProperties(b.physical, &info, &props);
+
+    if ((props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) == 0)
+    {
+        why = "the driver cannot import a D3D12 fence as a timeline semaphore";
+        return VK_NULL_HANDLE;
+    }
+
+    VkSemaphoreCreateInfo ci { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type };
+
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    if (vkCreateSemaphore(b.device, &ci, nullptr, &semaphore) != VK_SUCCESS)
+    {
+        why = "could not create the bridge semaphore";
+        return VK_NULL_HANDLE;
+    }
 
     VkImportSemaphoreWin32HandleInfoKHR import { VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
-    import.pNext = &type;
+    import.semaphore = semaphore;
     import.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
     import.handle = handle;
 
-    VkSemaphoreCreateInfo ci { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &import };
-
-    VkSemaphore semaphore = VK_NULL_HANDLE;
-    if (vkCreateSemaphore(device, &ci, nullptr, &semaphore) != VK_SUCCESS)
+    const VkResult r = b.importSemaphore(b.device, &import);
+    if (r != VK_SUCCESS)
+    {
+        vkDestroySemaphore(b.device, semaphore, nullptr);
+        why = "importing the shared fence failed (" + std::to_string(static_cast<int>(r)) + ")";
         return VK_NULL_HANDLE;
+    }
+
     return semaphore;
 }
 
@@ -108,14 +161,11 @@ inline VkSemaphore ShareAndImportFence(ID3D12Device* d3d, ID3D12Fence** out, std
         return VK_NULL_HANDLE;
     }
 
-    const VkSemaphore semaphore = ImportFence(TheBridge().device, handle);
+    const VkSemaphore semaphore = ImportFence(handle, why);
     CloseHandle(handle);
 
     if (semaphore == VK_NULL_HANDLE)
-    {
-        why = "the shared fence could not be imported as a timeline semaphore";
         return VK_NULL_HANDLE;
-    }
 
     *out = fence.Detach();
     return semaphore;
@@ -166,7 +216,12 @@ inline bool Create(ID3D12Device* d3d, std::string& why)
         if (id.deviceLUIDValid && std::memcmp(id.deviceLUID, &luid, sizeof luid) == 0)
         {
             if (props.properties.apiVersion >= VK_API_VERSION_1_3)
+            {
                 b.physical = device;
+                b.vendorId = props.properties.vendorID;
+                b.deviceId = props.properties.deviceID;
+                std::memcpy(b.deviceName, props.properties.deviceName, sizeof b.deviceName);
+            }
             break;
         }
     }
@@ -220,6 +275,14 @@ inline bool Create(ID3D12Device* d3d, std::string& why)
     }
 
     vkGetDeviceQueue(b.device, b.queueFamily, 0, &b.queue);
+
+    b.importSemaphore = reinterpret_cast<PFN_vkImportSemaphoreWin32HandleKHR>(
+        vkGetDeviceProcAddr(b.device, "vkImportSemaphoreWin32HandleKHR"));
+    if (b.importSemaphore == nullptr)
+    {
+        why = "the device has no vkImportSemaphoreWin32HandleKHR";
+        return false;
+    }
 
     VkCommandPoolCreateInfo poolInfo { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -283,15 +346,34 @@ inline VkResult Submit(uint64_t value, std::string& why)
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
+    if (b.lost)
+    {
+        why = "the Vulkan queue was given up on after " + std::to_string(b.timeouts) + " timeouts";
+        return VK_ERROR_DEVICE_LOST;
+    }
+
+    // Read what Vulkan makes of the two fences before touching either, so the log can say
+    // whether the hand-over ever had a shared object behind it at all.
+    vkGetSemaphoreCounterValue(b.device, b.toVkSem, &b.seenToVk);
+    vkGetSemaphoreCounterValue(b.device, b.fromVkSem, &b.seenFromVk);
+
     const uint32_t slot = b.next % 3;
     b.next += 1;
 
     const VkResult waited = vkWaitForFences(b.device, 1, &b.done[slot], VK_TRUE, kSlotWaitNs);
     if (waited != VK_SUCCESS)
     {
+        if (waited == VK_TIMEOUT)
+        {
+            b.timeouts += 1;
+            if (b.timeouts >= 3)
+                b.lost = true;
+        }
         why = waited == VK_TIMEOUT ? "the slot's last submission has not finished" : "vkWaitForFences failed";
         return waited;
     }
+
+    b.timeouts = 0;
 
     VkResult r = vkResetFences(b.device, 1, &b.done[slot]);
     if (r != VK_SUCCESS)

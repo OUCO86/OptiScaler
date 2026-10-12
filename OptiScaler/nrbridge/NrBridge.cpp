@@ -234,9 +234,13 @@ bool BuildGap(ID3D12Device* device)
         return false;
     }
 
-    LOG_INFO("NrBridge: Vulkan hand-over up on the game's own adapter (queue family {}): the slot can now "
-             "wait for the game and be waited on",
-             VulkanGap::TheBridge().queueFamily);
+    // The adapter is named, because "the game's own adapter" is a claim made from a LUID, and
+    // the host spoofs adapters. If the vendor is not 0x8086 the import below was made against a
+    // fence on another device, which is exactly the shape that waits forever.
+    auto& up = VulkanGap::TheBridge();
+    LOG_INFO("NrBridge: Vulkan hand-over up on {} (vendor 0x{:x} device 0x{:x}, queue family {}): the slot "
+             "can now wait for the game and be waited on",
+             up.deviceName, up.vendorId, up.deviceId, up.queueFamily);
 
     g.ready = true;
     return true;
@@ -293,10 +297,12 @@ int32_t EnqueueGap(void*, void* job, void* command_queue)
     {
         // Recorded, and left for the next frame: a Wait on a value nothing signalled would stop
         // the game's queue rather than slow it, so nothing is queued for it here.
+        //
+        // The reason is kept, not accumulated. A reason appended on every failure makes the log
+        // line grow with the frame count, and a log line that grows is a log that stops being
+        // readable exactly when the failure it describes is being looked for.
         g.vkFailures.fetch_add(1, std::memory_order_relaxed);
-        if (!g.failure.empty())
-            g.failure += "; ";
-        g.failure += why + " (" + std::to_string(static_cast<int>(vr)) + ")";
+        g.failure = why + " (" + std::to_string(static_cast<int>(vr)) + ")";
         g.failures.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
@@ -454,8 +460,12 @@ void LogFrame(const NrBridge::Frame& f)
     const UINT64 fromVkDone = vk.fromVk != nullptr ? vk.fromVk->GetCompletedValue() : 0;
     const UINT64 signalled = gap.signalled.load(std::memory_order_relaxed);
 
+    // toVkDone and gapSignalled are the same fence read by its two owners; seenToVk is what
+    // Vulkan makes of it. If seenToVk stays behind toVkDone, the import never shared the fence,
+    // and the Vulkan side will wait for a value nothing is going to give it.
     LOG_INFO("NrBridge gap: between={} enqueue={} skipped={} | runs={} submits={} failures={} cpu={:.3f}ms "
-             "max={:.3f}ms{} | vk submits={} failures={} | toVkDone={} fromVkDone={} gapSignalled={}",
+             "max={:.3f}ms{} | vk submits={} failures={}{} | toVkDone={} seenByVk={} | fromVkDone={} "
+             "seenByVk={} gapSignalled={}",
              pending.betweenHits.load(std::memory_order_relaxed),
              pending.enqueueCalls.load(std::memory_order_relaxed),
              pending.skippedHits.load(std::memory_order_relaxed),
@@ -463,7 +473,8 @@ void LogFrame(const NrBridge::Frame& f)
              gap.failures.load(std::memory_order_relaxed), gap.cpuTotalMs.load(std::memory_order_relaxed),
              gap.cpuMaxMs.load(std::memory_order_relaxed), gap.failure.empty() ? "" : gap.failure.c_str(),
              gap.vkSubmits.load(std::memory_order_relaxed), gap.vkFailures.load(std::memory_order_relaxed),
-             toVkDone, fromVkDone, signalled);
+             vk.lost ? " (vk given up on after " + std::to_string(vk.timeouts) + " timeouts)" : "",
+             toVkDone, vk.seenToVk, fromVkDone, vk.seenFromVk, signalled);
 }
 
 // Built on first use and never rebuilt, matching the reference: it builds what it needs on first
