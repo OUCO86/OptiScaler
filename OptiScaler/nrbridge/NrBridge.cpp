@@ -131,6 +131,10 @@ std::string g_failureReason;
 std::atomic<unsigned long long> g_splitOk { 0 };
 std::atomic<unsigned long long> g_splitNoProxy { 0 };
 std::atomic<unsigned long long> g_splitFailed { 0 };
+// The HRESULT of the last cut, kept only so it can be printed the way the reference prints it:
+// its own boundary line carries cutHr={:X}, because a cut that stopped working shows up there
+// before it shows up anywhere else.
+std::atomic<HRESULT> g_lastCutHr { S_OK };
 
 // The split can only be made on a list this host wrapped as it was created, so the wrapping
 // hook has to be in place before the game asks for another one. Nothing is cut here: this only
@@ -256,17 +260,29 @@ void LogFrame(const NrBridge::Frame& f)
             LOG_WARN("NrBridge: no motion vectors in this evaluate -- temporal work must fall back");
     }
 
-    // The cut on the same cadence as the frame line, so the two can be read together. between
-    // counts every time the slot ran, enqueue counts every time it called through, and skipped
-    // counts the times it ran with nothing pending -- which, with no renderer attached, is all
-    // of them. A cut that never reaches the slot would show split climbing with between stuck.
-    auto& pending = DlssNr::Backend::LmxxfCut::Pending();
-    LOG_INFO("NrBridge cut: split={} notProxied={} refused={} | between={} enqueue={} skipped={}",
-             g_splitOk.load(std::memory_order_relaxed), g_splitNoProxy.load(std::memory_order_relaxed),
-             g_splitFailed.load(std::memory_order_relaxed),
-             pending.betweenHits.load(std::memory_order_relaxed),
-             pending.enqueueCalls.load(std::memory_order_relaxed),
-             pending.skippedHits.load(std::memory_order_relaxed));
+    // Printed with the reference's own field names, from its LmxxfBackend::RecordDiagnostic
+    // line, because the question "did both halves of the cut actually reach the queue" is the
+    // question that line exists to answer:
+    //
+    //   lmxxf boundary: eval={} proxy={} cutHr={:X} proxyHits={} cutsRecorded={} rejected={}
+    //   unsplitSubmitted={} producerSubmitted={} continuationSubmitted={} submitFailures={}
+    //   (counts are NOT GPU completion)
+    //
+    // producerSubmitted and continuationSubmitted are the two that matter here, and they are
+    // the reference's own counts of its two Execute calls, not anything of ours. The between
+    // slot's own counters are deliberately not used to judge this: with nothing enqueued the
+    // reference's BetweenThunk returns before it counts anything, so they read zero whether or
+    // not the slot ran.
+    LOG_INFO("NrBridge boundary: eval={} cutHr={:X} proxyHits={} cutsRecorded={} rejected={} "
+             "unsplitSubmitted={} producerSubmitted={} continuationSubmitted={} submitFailures={} "
+             "(counts are NOT GPU completion)",
+             n, static_cast<unsigned>(g_lastCutHr.load(std::memory_order_relaxed)),
+             g_splitOk.load(std::memory_order_relaxed) + g_splitFailed.load(std::memory_order_relaxed),
+             g_splitOk.load(std::memory_order_relaxed), g_splitFailed.load(std::memory_order_relaxed),
+             DlssNr::Submission::g_unsplitProxySubmissions.load(std::memory_order_relaxed),
+             DlssNr::Submission::g_splitSubmissions.load(std::memory_order_relaxed),
+             DlssNr::Submission::g_continuationSubmissions.load(std::memory_order_relaxed),
+             DlssNr::Submission::g_submissionFailures.load(std::memory_order_relaxed));
 }
 
 // Built on first use and never rebuilt, matching the reference: it builds what it needs on first
@@ -345,6 +361,7 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
     // attached yet, so the two calls around it do not exist and nothing is enqueued for the
     // slot to run: what is left is the cut on its own, which is the only thing being measured.
     const HRESULT hr = DlssNr::Backend::LmxxfCut::TrySplitAtEvaluate(cmd);
+    g_lastCutHr.store(hr, std::memory_order_relaxed);
     if (hr == S_OK)
         g_splitOk.fetch_add(1, std::memory_order_relaxed);
     else if (hr == S_FALSE)
