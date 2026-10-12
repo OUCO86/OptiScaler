@@ -15,6 +15,8 @@
 
 #include <upscaler_time/UpscalerTime_Dx12.h>
 
+#include <nrbridge/NrBridge.h>
+
 #include <hooks/D3D12_Hooks.h>
 
 #include <dxgi1_4.h>
@@ -939,6 +941,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         UpscalerTimeDx12::UpscaleStart(InCmdList);
 
     auto evalResult = false;
+
+    // Our bridge reads this evaluate before the upscaler consumes it. Stage one reports only:
+    // it must be shown to receive the vectors before it is allowed to touch a pixel.
+    if (Config::Instance()->NrBridgeProbe.value_or_default())
+        NrBridge::ProbeBeforeUpscale(InCmdList, InParameters);
 
     // Run upscaler
     {

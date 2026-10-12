@@ -334,6 +334,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\rcas\shaders\RCAS_Shader.h" />
     <ClInclude Include="spoofing\User32_Spoofing.h" />
     <ClInclude Include="hooks\VulkanwDx12_Hooks.h" />
+    <ClInclude Include="nrbridge\NrBridge.h" />
     <ClInclude Include="inputs\FSR2_Dx11.h" />
     <ClInclude Include="inputs\FSR2_Vk.h" />
     <ClInclude Include="inputs\XeSS_Dx11.h" />
@@ -716,6 +717,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="inputs\NVNGX.cpp" />
     <ClCompile Include="inputs\NVNGX_DLSS_Dx11.cpp" />
     <ClCompile Include="inputs\NVNGX_DLSS_Dx12.cpp" />
+    <ClCompile Include="nrbridge\NrBridge.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="inputs\NVNGX_DLSS_Vk.cpp" />
     <ClCompile Include="upscalers\xess\XeSSFeature.cpp" />
