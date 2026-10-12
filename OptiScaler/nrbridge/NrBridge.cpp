@@ -27,6 +27,11 @@
 // so it needs a sibling of submission/, not a child.
 #include "cut/LmxxfEvaluateCut.h"
 
+// The Vulkan side of the hand-over: the device on the game's adapter, and the two shared fences
+// the slot's submission waits on and signals. Separate module, for the same reason the reference
+// keeps its pe bridge separate.
+#include "VulkanGap.h"
+
 // The shape of everything here comes from the reference integration; see NrBridge.h. What is
 // ours is only the part that has to be: reading this host's parameter block, and resolving the
 // state each resource is actually in before anything is recorded.
@@ -196,15 +201,16 @@ void* GapJobHandle(unsigned long long serial)
 struct Gap
 {
     Microsoft::WRL::ComPtr<ID3D12Device> device;
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
     UINT64 nextValue = GapFenceBase;
     std::atomic<UINT64> signalled { 0 };
     bool ready = false;
-    const char* failure = "";
+    std::string failure;
 
     std::atomic<unsigned long long> runs { 0 };
     std::atomic<unsigned long long> submits { 0 };
     std::atomic<unsigned long long> failures { 0 };
+    std::atomic<unsigned long long> vkSubmits { 0 };
+    std::atomic<unsigned long long> vkFailures { 0 };
     std::atomic<double> cpuTotalMs { 0.0 };
     std::atomic<double> cpuMaxMs { 0.0 };
 };
@@ -221,11 +227,16 @@ bool BuildGap(ID3D12Device* device)
 {
     Gap& g = TheGap();
 
-    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence))))
+    std::string why;
+    if (!VulkanGap::Create(device, why))
     {
-        g.failure = "CreateFence";
+        g.failure = "VulkanGap: " + why;
         return false;
     }
+
+    LOG_INFO("NrBridge: Vulkan hand-over up on the game's own adapter (queue family {}): the slot can now "
+             "wait for the game and be waited on",
+             VulkanGap::TheBridge().queueFamily);
 
     g.ready = true;
     return true;
@@ -259,22 +270,38 @@ int32_t EnqueueGap(void*, void* job, void* command_queue)
     const unsigned long long run = g.runs.fetch_add(1, std::memory_order_relaxed) + 1;
     const bool announce = run <= 20;
 
-    // The signal the reference itself queues in this position: after its producer half and
-    // before its continuation half, RunNetwork calls producer->Signal on the game's queue to
-    // hand the frame to the Vulkan side. Ours carries no work with it yet, so the fence's only
-    // reader is this host: a value that climbs means the call ran, and the same value read back
-    // through GetCompletedValue means the GPU reached the gap the call enqueued.
+    // The reference's own order, and the reason for it: the game's queue says where the frame
+    // has got to (Signal on the fence Vulkan waits on), Vulkan runs, and Vulkan's own signal
+    // is what the game's queue is later made to wait on. The hand-over fence is the one the
+    // bridge imported, so the value enqueued here is the value the Vulkan queue waits for --
+    // the frame's producer half completes before any of this runs.
     const UINT64 value = g.nextValue++;
-    const HRESULT hr = queue->Signal(g.fence.Get(), value);
+    auto& vk = VulkanGap::TheBridge();
+    const HRESULT hr = queue->Signal(vk.toVk.Get(), value);
     g.signalled.store(value, std::memory_order_relaxed);
 
     if (FAILED(hr))
     {
-        g.failure = "Signal";
+        g.failure = "Signal(toVk)";
         g.failures.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
 
+    std::string why;
+    const VkResult vr = VulkanGap::Submit(value, why);
+    if (vr != VK_SUCCESS)
+    {
+        // Recorded, and left for the next frame: a Wait on a value nothing signalled would stop
+        // the game's queue rather than slow it, so nothing is queued for it here.
+        g.vkFailures.fetch_add(1, std::memory_order_relaxed);
+        if (!g.failure.empty())
+            g.failure += "; ";
+        g.failure += why + " (" + std::to_string(static_cast<int>(vr)) + ")";
+        g.failures.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+
+    g.vkSubmits.fetch_add(1, std::memory_order_relaxed);
     g.submits.fetch_add(1, std::memory_order_relaxed);
 
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -416,21 +443,27 @@ void LogFrame(const NrBridge::Frame& f)
     auto& pending = DlssNr::Backend::LmxxfCut::Pending();
     Gap& gap = TheGap();
 
-    // The GPU half of the proof: the value the last slot run queued, and the value the GPU has
-    // actually reached. Done >= signalled says the queue carried the gap's signal out in order,
-    // not just that the CPU call happened.
-    const UINT64 done = gap.fence != nullptr ? gap.fence->GetCompletedValue() : 0;
+    // Both halves of the hand-over, read back from the fences themselves. toVk is the fence the
+    // game's queue signals and Vulkan waits on: its completed value catching the last value
+    // queued is the GPU reaching the gap in order. fromVk is the one Vulkan signals: its value
+    // climbing is the Vulkan queue having run and handed the frame back, which is what lets the
+    // game's queue be made to wait on it -- that Wait is the next step and is not queued yet,
+    // because a wait on a value nothing signals stops the queue instead of slowing it.
+    auto& vk = VulkanGap::TheBridge();
+    const UINT64 toVkDone = vk.toVk != nullptr ? vk.toVk->GetCompletedValue() : 0;
+    const UINT64 fromVkDone = vk.fromVk != nullptr ? vk.fromVk->GetCompletedValue() : 0;
     const UINT64 signalled = gap.signalled.load(std::memory_order_relaxed);
 
     LOG_INFO("NrBridge gap: between={} enqueue={} skipped={} | runs={} submits={} failures={} cpu={:.3f}ms "
-             "max={:.3f}ms{} gpuDone={} gapSignalled={}",
+             "max={:.3f}ms{} | vk submits={} failures={} | toVkDone={} fromVkDone={} gapSignalled={}",
              pending.betweenHits.load(std::memory_order_relaxed),
              pending.enqueueCalls.load(std::memory_order_relaxed),
              pending.skippedHits.load(std::memory_order_relaxed),
              gap.runs.load(std::memory_order_relaxed), gap.submits.load(std::memory_order_relaxed),
              gap.failures.load(std::memory_order_relaxed), gap.cpuTotalMs.load(std::memory_order_relaxed),
-             gap.cpuMaxMs.load(std::memory_order_relaxed), gap.failure[0] != 0 ? gap.failure : "",
-             done, signalled);
+             gap.cpuMaxMs.load(std::memory_order_relaxed), gap.failure.empty() ? "" : gap.failure.c_str(),
+             gap.vkSubmits.load(std::memory_order_relaxed), gap.vkFailures.load(std::memory_order_relaxed),
+             toVkDone, fromVkDone, signalled);
 }
 
 // Built on first use and never rebuilt, matching the reference: it builds what it needs on first
