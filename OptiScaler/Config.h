@@ -376,6 +376,12 @@ class Config
     // it detours CreateCommandList for every list the game makes, so it is switched on only to
     // ask whether the cut is possible, and switching it off leaves the game exactly as it was.
     CustomOptional<bool> NrWrapLists { false };
+    // Wrap command lists the game builds during boot, before the first swapchain. The
+    // reference's setting is LmxxfEarlyExeWrap and its rule for auto is quoted in
+    // notes/optiscaler-bridge.md §20: "Auto admits early EXE calls in Unreal/Forza". Left
+    // unset, auto is what Unreal resolves to, which is why the default here is empty rather
+    // than false.
+    CustomOptional<bool, NoDefault> NrEarlyExeWrap;
     CustomOptional<bool> RestoreComputeSignature { false };
     CustomOptional<bool> RestoreGraphicSignature { false };
     CustomOptional<bool> ExtendedStateRestore { false };

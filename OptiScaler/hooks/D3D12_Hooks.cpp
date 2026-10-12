@@ -13,6 +13,7 @@
 #include <proxies/XeSS_Proxy.h>
 #include <proxies/IGDExt_Proxy.h>
 #include <proxies/KernelBase_Proxy.h>
+#include <nrbridge/NrBridge.h>
 
 #include <detours/detours.h>
 
@@ -1417,6 +1418,13 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
         //     UnhookDevice();
 
         HookToDevice(State::Instance().currentD3D12Device);
+
+        // Arming the submission hook has to happen while the game is still building its first
+        // command lists: a list that already exists cannot be wrapped, and Unreal keeps the
+        // ones it made during boot. This is the reference's own arming point -- the log lines
+        // it prints for it are named after this function.
+        NrBridge::HookToDevice(State::Instance().currentD3D12Device);
+
         _d3d12Captured = true;
 
         State::Instance().d3d12Devices.push_back((ID3D12Device*) *ppDevice);
@@ -1545,6 +1553,13 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
         }
 
         HookToDevice(State::Instance().currentD3D12Device);
+
+        // Arming the submission hook has to happen while the game is still building its first
+        // command lists: a list that already exists cannot be wrapped, and Unreal keeps the
+        // ones it made during boot. This is the reference's own arming point -- the log lines
+        // it prints for it are named after this function.
+        NrBridge::HookToDevice(State::Instance().currentD3D12Device);
+
         _d3d12Captured = true;
 
         State::Instance().d3d12Devices.push_back((ID3D12Device*) *ppDevice);
