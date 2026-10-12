@@ -335,6 +335,12 @@ int32_t EnqueueGap(void*, void* job, void* command_queue)
 
     g.runs.fetch_add(1, std::memory_order_relaxed);
 
+    // Every run is logged for the first twenty, because a probe that kills the device on its
+    // second or third execution dies before the periodic counters ever print. After twenty the
+    // slot is either proven or it has already failed loudly somewhere else.
+    const auto runsNow = g.runs.load(std::memory_order_relaxed);
+    const bool announce = runsNow <= 20;
+
     const unsigned slot = g.next++ % GapSlotCount;
 
     // The allocator cannot be reset while the GPU still has the last frame's copy queued on it,
@@ -399,13 +405,17 @@ int32_t EnqueueGap(void*, void* job, void* command_queue)
     {
     }
 
+    if (announce)
+        LOG_INFO("NrBridge gap run #{}: queue={} slot={} fence={} took={:.3f}ms", runsNow, command_queue,
+                 slot, signal, ms);
+
     return 0;
 }
 
 void ReportSplitEligibility(ID3D12GraphicsCommandList* cmdList, unsigned long long n)
 {
     const bool early = n < 6;
-    const bool periodic = (n % 600) == 0;
+    const bool periodic = (n % 200) == 0;
     if (!early && !periodic)
         return;
 
@@ -476,7 +486,7 @@ void LogFrame(const NrBridge::Frame& f)
 {
     const auto n = g_seen.load(std::memory_order_relaxed);
     const bool early = n < 6;
-    const bool periodic = (n % 600) == 0;
+    const bool periodic = (n % 200) == 0;
 
     if (!early && !periodic)
         return;
@@ -623,6 +633,13 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
         // that record the network's inputs and its outputs. BetweenThunk then calls the
         // function once, when the cut list reaches the queue, between its two halves.
         const auto serial = g_splitOk.load(std::memory_order_relaxed);
+
+        // Logged for the first twenty, for the same reason the gap run is: a crash between
+        // the cut and the slot has to be visible in the log, and the periodic line is too
+        // sparse to show it.
+        if (serial <= 20)
+            LOG_INFO("NrBridge cut #{}: list {} armed for the slot", serial, static_cast<void*>(cmd));
+
         DlssNr::Backend::LmxxfCut::SetPendingEnqueue(this, GapJobHandle(serial), &EnqueueGap, nullptr,
                                                      static_cast<ID3D12CommandList*>(cmd), nullptr);
     }
