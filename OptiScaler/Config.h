@@ -368,8 +368,10 @@ class Config
     CustomOptional<int, NoDefault> RoundInternalResolution; // disabled by default
 
     CustomOptional<int, NoDefault> SkipFirstFrames; // disabled by default
-    // NrBridge: read and log what the upscaler is handed, once per few frames, changing nothing.
-    CustomOptional<bool> NrBridgeProbe { true };
+    // [DlssNr] -- the reference integration's own section and key names, so that its
+    // documentation and an ini written for it both apply here unchanged.
+    CustomOptional<bool> NrEnabled { false };
+    CustomOptional<bool> NrRunBeforeSR { true };
     CustomOptional<bool> RestoreComputeSignature { false };
     CustomOptional<bool> RestoreGraphicSignature { false };
     CustomOptional<bool> ExtendedStateRestore { false };

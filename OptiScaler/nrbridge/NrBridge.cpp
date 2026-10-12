@@ -2,64 +2,25 @@
 
 #include <nrbridge/NrBridge.h>
 
+#include "Config.h"
 #include "State.h"
+#include "Util.h"
 
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 
+// The shape of everything here comes from the reference integration; see NrBridge.h. What is
+// ours is only the part that has to be: reading this host's parameter block, and resolving the
+// state each resource is actually in before anything is recorded.
+namespace
+{
 // Reading the parameter block is deliberately done the way the rest of the host does it: a typed
 // Get first, then the untyped one. The host sets these keys from two different places (the FFX
 // path and the NGX path) and they do not agree on which overload is populated, so a single Get
 // would silently read nothing on one of them.
-namespace
-{
-const char* FormatName(DXGI_FORMAT f)
-{
-    switch (f)
-    {
-    case DXGI_FORMAT_R8G8B8A8_UNORM:
-        return "R8G8B8A8_UNORM";
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-        return "R8G8B8A8_UNORM_SRGB";
-    case DXGI_FORMAT_R16G16B16A16_FLOAT:
-        return "R16G16B16A16_FLOAT";
-    case DXGI_FORMAT_R10G10B10A2_UNORM:
-        return "R10G10B10A2_UNORM";
-    case DXGI_FORMAT_R11G11B10_FLOAT:
-        return "R11G11B10_FLOAT";
-    case DXGI_FORMAT_R16G16_FLOAT:
-        return "R16G16_FLOAT";
-    case DXGI_FORMAT_R16G16_UNORM:
-        return "R16G16_UNORM";
-    case DXGI_FORMAT_R32_FLOAT:
-        return "R32_FLOAT";
-    case DXGI_FORMAT_D32_FLOAT:
-        return "D32_FLOAT";
-    case DXGI_FORMAT_R24G8_TYPELESS:
-        return "R24G8_TYPELESS";
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-        return "R32G8X24_TYPELESS";
-    default:
-        return "?";
-    }
-}
-
-std::string Describe(const char* what, ID3D12Resource* r)
-{
-    if (r == nullptr)
-        return std::string(what) + "=absent";
-
-    auto d = r->GetDesc();
-    char buf[192];
-    std::snprintf(buf, sizeof(buf), "%s=%ux%u %s(%u)%s%s", what, static_cast<unsigned>(d.Width),
-                  static_cast<unsigned>(d.Height), FormatName(d.Format), static_cast<unsigned>(d.Format),
-                  (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? " rt" : "",
-                  (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? " uav" : "");
-    return std::string(buf);
-}
-
 ID3D12Resource* ReadResource(NVSDK_NGX_Parameter* p, const char* key)
 {
     ID3D12Resource* r = nullptr;
@@ -84,29 +45,79 @@ unsigned int ReadUInt(NVSDK_NGX_Parameter* p, const char* key)
     return v;
 }
 
+// Whether this game is on Unreal, which decides what state several of these resources are left
+// in. The test is the host's own, copied from the XeSS path that has to ask the same question.
+bool IsUnreal()
+{
+    // The third test is written the way the host writes it: gameQuirks is a flag_set, which
+    // answers a truth question directly and does not compare against an integer.
+    return State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
+           State::Instance().GameEngine == GameEngineType::Unreal ||
+           State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine;
+}
+
+D3D12_RESOURCE_STATES ResolveState(const CustomOptional<int32_t, NoDefault>& configured,
+                                   D3D12_RESOURCE_STATES unrealFallback, D3D12_RESOURCE_STATES otherFallback)
+{
+    // Configured wins: the user set it because this game is the exception. Otherwise the answer
+    // is what the host's own upscaler assumes, which differs between Unreal and everything else
+    // -- and a wrong StateBefore is not an error that fails politely on a shipped driver.
+    if (configured.has_value())
+        return static_cast<D3D12_RESOURCE_STATES>(configured.value());
+
+    return IsUnreal() ? unrealFallback : otherFallback;
+}
+
+const char* FormatName(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+        return "R8G8B8A8_UNORM";
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return "R16G16B16A16_FLOAT";
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return "R10G10B10A2_UNORM";
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        return "R11G11B10_FLOAT";
+    case DXGI_FORMAT_R16G16_FLOAT:
+        return "R16G16_FLOAT";
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+        return "R32G8X24_TYPELESS";
+    default:
+        return "?";
+    }
+}
+
+std::string Describe(const char* what, ID3D12Resource* r)
+{
+    if (r == nullptr)
+        return std::string(what) + "=absent";
+
+    auto d = r->GetDesc();
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), "%s=%ux%u %s(%u)%s%s", what, static_cast<unsigned>(d.Width),
+                  static_cast<unsigned>(d.Height), FormatName(d.Format), static_cast<unsigned>(d.Format),
+                  (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? " rt" : "",
+                  (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? " uav" : "");
+    return std::string(buf);
+}
+
 std::atomic<unsigned long long> g_seen { 0 };
 std::atomic<bool> g_contractLogged { false };
-} // namespace
+std::atomic<bool> g_failed { false };
+std::atomic<NrBridge::Backend*> g_backend { nullptr };
+std::mutex g_backendMutex;
+std::string g_failureReason;
 
-namespace NrBridge
+NrBridge::Frame ReadFrame(NVSDK_NGX_Parameter* params)
 {
-void ProbeBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params)
-{
-    if (params == nullptr)
-        return;
+    NrBridge::Frame f {};
 
-    const auto n = g_seen.fetch_add(1, std::memory_order_relaxed);
-
-    Frame f {};
     f.colour = ReadResource(params, NVSDK_NGX_Parameter_Color);
     f.motion = ReadResource(params, NVSDK_NGX_Parameter_MotionVectors);
     f.depth = ReadResource(params, NVSDK_NGX_Parameter_Depth);
     f.exposure = ReadResource(params, NVSDK_NGX_Parameter_ExposureTexture);
-
-    f.hasColour = f.colour != nullptr;
-    f.hasMotion = f.motion != nullptr;
-    f.hasDepth = f.depth != nullptr;
-    f.hasExposure = f.exposure != nullptr;
 
     f.width = ReadUInt(params, NVSDK_NGX_Parameter_Width);
     f.height = ReadUInt(params, NVSDK_NGX_Parameter_Height);
@@ -117,30 +128,197 @@ void ProbeBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter*
     f.preExposure = ReadFloat(params, NVSDK_NGX_Parameter_DLSS_Pre_Exposure, 1.0f);
     f.reset = ReadUInt(params, NVSDK_NGX_Parameter_Reset) != 0;
 
-    // The first frames are printed in full and then it goes quiet: a per-frame log line at 100
-    // frames a second is unreadable, and what matters about the steady state is only whether it
-    // is still the same contract.
+    // The vectors here are the same size as the colour in this game, and the reference records
+    // the extent separately because that is not true everywhere. Left at zero, which is what
+    // "render-resolution vectors" means there.
+    f.motionWidth = 0;
+    f.motionHeight = 0;
+
+    // Whether the vectors already carry the jitter, and which way the depth runs. The host knows
+    // both from the flags the upscaler was created with, so they are read from it rather than
+    // guessed: a temporal pass that unjitters twice is worse than one that does not.
+    auto* feature = State::Instance().currentFeature;
+    f.motionJittered = feature != nullptr && feature->JitteredMV();
+    f.depthInverted = feature != nullptr && feature->DepthInverted();
+    f.temporalInputsValid = f.motion != nullptr && f.depth != nullptr;
+
+    f.colourState = ResolveState(Config::Instance()->ColorResourceBarrier, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    f.motionState = ResolveState(Config::Instance()->MVResourceBarrier, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    f.depthState = ResolveState(Config::Instance()->DepthResourceBarrier,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    f.exposureState = ResolveState(Config::Instance()->ExposureResourceBarrier,
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    return f;
+}
+
+void LogFrame(const NrBridge::Frame& f)
+{
+    const auto n = g_seen.load(std::memory_order_relaxed);
     const bool early = n < 6;
     const bool periodic = (n % 600) == 0;
 
     if (!early && !periodic)
         return;
 
-    LOG_INFO("NrBridge frame {} cmdList={} {}x{} mv=({},{}) jitter=({:.3f},{:.3f}) preExp={:.3f} "
-             "reset={} | {} | {} | {}",
-             n, static_cast<void*>(cmdList), f.width, f.height, f.motionScaleX, f.motionScaleY, f.jitterX,
-             f.jitterY, f.preExposure, f.reset ? 1 : 0, Describe("color", f.colour), Describe("mv", f.motion),
+    LOG_INFO("NrBridge frame {} {}x{} mv=({},{}) jitter=({:.3f},{:.3f}) preExp={:.3f} reset={} | {} | {} | {}",
+             n, f.width, f.height, f.motionScaleX, f.motionScaleY, f.jitterX, f.jitterY, f.preExposure,
+             f.reset ? 1 : 0, Describe("color", f.colour), Describe("mv", f.motion),
              Describe("depth", f.depth));
 
     if (!g_contractLogged.exchange(true, std::memory_order_relaxed))
     {
         // Printed once, because it is the sentence this whole host exists for. If this says the
         // vectors are absent, nothing downstream is allowed to proceed.
-        LOG_INFO("NrBridge contract: motion={} depth={} exposure={} backend={}", f.hasMotion, f.hasDepth,
-                 f.hasExposure, Config::Instance()->Dx12Upscaler.value_or_default());
+        LOG_INFO("NrBridge contract: motion={} depth={} exposure={} backend={}", f.motion != nullptr,
+                 f.depth != nullptr, f.exposure != nullptr,
+                 Config::Instance()->Dx12Upscaler.value_or_default());
 
-        if (!f.hasMotion)
+        if (f.motion == nullptr)
             LOG_WARN("NrBridge: no motion vectors in this evaluate -- temporal work must fall back");
     }
 }
+
+// Built on first use and never rebuilt, matching the reference: it builds what it needs on first
+// use and disables itself for the session if anything fails, rather than retrying into a crash.
+NrBridge::Backend* EnsureBackend(ID3D12CommandQueue* timingQueue)
+{
+    auto* existing = g_backend.load(std::memory_order_acquire);
+    if (existing != nullptr)
+        return existing;
+
+    std::lock_guard<std::mutex> guard(g_backendMutex);
+
+    existing = g_backend.load(std::memory_order_relaxed);
+    if (existing != nullptr)
+        return existing;
+
+    auto* queue = timingQueue != nullptr ? timingQueue : State::Instance().currentCommandQueue;
+    if (queue == nullptr)
+    {
+        // Not a failure: the queue only exists once a swapchain does. Try again on a later frame.
+        return nullptr;
+    }
+
+    ID3D12Device* device = nullptr;
+    if (FAILED(queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device))) ||
+        device == nullptr)
+    {
+        g_failureReason = "no device from the command queue";
+        g_failed.store(true, std::memory_order_release);
+        LOG_WARN("NrBridge: {} -- pass disabled for this session", g_failureReason);
+        return nullptr;
+    }
+
+    auto* backend = new NrBridge::Backend(device, queue, Util::DllPath().parent_path());
+    g_backend.store(backend, std::memory_order_release);
+    LOG_INFO("NrBridge: backend created on queue {}", static_cast<void*>(queue));
+    return backend;
+}
+} // namespace
+
+namespace NrBridge
+{
+struct Backend::Impl
+{
+    ID3D12Device* device = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    std::filesystem::path directory;
+    std::atomic<unsigned long long> recorded { 0 };
+};
+
+Backend::Backend(ID3D12Device* device, ID3D12CommandQueue* queue, const std::filesystem::path& directory)
+    : p(new Impl { device, queue, directory })
+{
+}
+
+// Nothing is recorded yet: this is the seam the renderer will be attached to, and until it is,
+// the frame the game handed over is the frame the upscaler gets. A null return is the reference's
+// own signal for "skip", so the caller's behaviour is already correct either way.
+ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList*, const Frame& f, const Settings&)
+{
+    if (f.motion == nullptr)
+        return nullptr;
+
+    p->recorded.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+}
+
+int Backend::PendingListIndex(UINT, ID3D12CommandList* const*) const { return -1; }
+void Backend::Submitting(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*) { }
+void Backend::TraceBoundary(const std::string&) { }
+void Backend::Submitted(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*) { }
+bool Backend::Ready() { return true; }
+bool Backend::Shutdown() { return true; }
+void Backend::ReleaseSession() { }
+bool Backend::PollRelease() { return true; }
+bool Backend::CompletePendingReleaseLocked() { return true; }
+void Backend::ResetGraphicsWaitState() { }
+void Backend::InvalidateHistory() { }
+std::string Backend::Status() const { return "no renderer attached"; }
+bool Backend::IsRunning() const { return false; }
+UINT64 Backend::RecordedFrames() const { return p->recorded.load(std::memory_order_relaxed); }
+
+void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
+                           ID3D12CommandQueue* timingQueue)
+{
+    if (params == nullptr)
+        return;
+
+    const auto n = g_seen.fetch_add(1, std::memory_order_relaxed);
+
+    if (!Config::Instance()->NrEnabled.value_or_default())
+        return;
+
+    if (g_failed.load(std::memory_order_acquire))
+        return;
+
+    const Frame f = ReadFrame(params);
+    LogFrame(f);
+
+    if (!Config::Instance()->NrRunBeforeSR.value_or_default())
+        return;
+
+    auto* backend = EnsureBackend(timingQueue);
+    if (backend == nullptr)
+        return;
+
+    Settings settings {};
+    auto* input = backend->Record(cmdList, f, settings);
+
+    // The reference hands the result of Record to the upscaler as its colour input, and leaves
+    // the frame alone when it answers null. Same here.
+    if (input != nullptr && input != f.colour)
+        params->Set(NVSDK_NGX_Parameter_Color, static_cast<void*>(input));
+
+    if (n == 5)
+        LOG_INFO("NrBridge: recorded {} frames", backend->RecordedFrames());
+}
+
+void Shutdown()
+{
+    auto* backend = g_backend.exchange(nullptr, std::memory_order_acq_rel);
+    if (backend != nullptr)
+        backend->Shutdown();
+}
+
+bool IsRunning()
+{
+    auto* backend = g_backend.load(std::memory_order_acquire);
+    return backend != nullptr && backend->IsRunning();
+}
+
+const char* FailureReason() { return g_failureReason.c_str(); }
+
+void RetryAfterFailure()
+{
+    g_failureReason.clear();
+    g_failed.store(false, std::memory_order_release);
+}
+
+void RenderMenu(::Config*, float) { }
 } // namespace NrBridge

@@ -942,12 +942,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
 
     auto evalResult = false;
 
-    // Our bridge reads this evaluate before the upscaler consumes it. Stage one reports only:
-    // it must be shown to receive the vectors before it is allowed to touch a pixel.
-    if (Config::Instance()->NrBridgeProbe.value_or_default())
-    {
-        NrBridge::ProbeBeforeUpscale(InCmdList, InParameters);
-    }
+    // The reference's own call, in the reference's own place: over Color immediately before
+    // Super Resolution consumes it. timingQueue is passed because it is known here and is the
+    // only way the pass can report what it cost.
+    NrBridge::EvaluateBeforeUpscale(InCmdList, InParameters, State::Instance().currentCommandQueue);
 
     // Run upscaler
     {

@@ -569,7 +569,8 @@ bool Config::Reload(std::filesystem::path iniPath)
 
             RoundInternalResolution.set_from_config(readInt("Hotfix", "RoundInternalResolution"));
 
-            NrBridgeProbe.set_from_config(readBool("Hotfix", "NrBridgeProbe"));
+            NrEnabled.set_from_config(readBool("DlssNr", "Enabled"));
+            NrRunBeforeSR.set_from_config(readBool("DlssNr", "RunBeforeSR"));
             RestoreComputeSignature.set_from_config(readBool("Hotfix", "RestoreComputeSignature"));
             RestoreGraphicSignature.set_from_config(readBool("Hotfix", "RestoreGraphicSignature"));
             ExtendedStateRestore.set_from_config(readBool("Hotfix", "ExtendedStateRestore"));
@@ -1216,8 +1217,9 @@ bool Config::SaveIni()
         ini.SetValue("Hotfix", "RoundInternalResolution",
                      GetIntValue(Instance()->RoundInternalResolution.value_for_config()).c_str());
 
-        ini.SetValue("Hotfix", "NrBridgeProbe",
-                     GetBoolValue(Instance()->NrBridgeProbe.value_for_config()).c_str());
+        ini.SetValue("DlssNr", "Enabled", GetBoolValue(Instance()->NrEnabled.value_for_config()).c_str());
+        ini.SetValue("DlssNr", "RunBeforeSR",
+                     GetBoolValue(Instance()->NrRunBeforeSR.value_for_config()).c_str());
         ini.SetValue("Hotfix", "RestoreComputeSignature",
                      GetBoolValue(Instance()->RestoreComputeSignature.value_for_config()).c_str());
         ini.SetValue("Hotfix", "RestoreGraphicSignature",
