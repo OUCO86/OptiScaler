@@ -372,6 +372,10 @@ class Config
     // documentation and an ini written for it both apply here unchanged.
     CustomOptional<bool> NrEnabled { false };
     CustomOptional<bool> NrRunBeforeSR { true };
+    // Wrap the game's command lists so they can be cut around the evaluate. Off by default:
+    // it detours CreateCommandList for every list the game makes, so it is switched on only to
+    // ask whether the cut is possible, and switching it off leaves the game exactly as it was.
+    CustomOptional<bool> NrWrapLists { false };
     CustomOptional<bool> RestoreComputeSignature { false };
     CustomOptional<bool> RestoreGraphicSignature { false };
     CustomOptional<bool> ExtendedStateRestore { false };

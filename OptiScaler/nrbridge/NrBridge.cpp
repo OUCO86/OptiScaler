@@ -12,6 +12,11 @@
 #include <mutex>
 #include <string>
 
+// The command-list split, taken from the reference integration without modification. It is
+// included after everything of the host's, because it brings its own Detours header.
+#include "submission/CommandListProxy.h"
+#include "submission/SubmissionHooks.h"
+
 // The shape of everything here comes from the reference integration; see NrBridge.h. What is
 // ours is only the part that has to be: reading this host's parameter block, and resolving the
 // state each resource is actually in before anything is recorded.
@@ -106,9 +111,55 @@ std::string Describe(const char* what, ID3D12Resource* r)
 std::atomic<unsigned long long> g_seen { 0 };
 std::atomic<bool> g_contractLogged { false };
 std::atomic<bool> g_failed { false };
+std::atomic<bool> g_hooksTried { false };
 std::atomic<NrBridge::Backend*> g_backend { nullptr };
 std::mutex g_backendMutex;
 std::string g_failureReason;
+
+// The split can only be made on a list this host wrapped as it was created, so the wrapping
+// hook has to be in place before the game asks for another one. Nothing is cut here: this only
+// reports whether the list the game handed us is one that could be.
+void EnsureSubmissionArmed(ID3D12Device* device, ID3D12CommandQueue* queue)
+{
+    if (g_hooksTried.exchange(true, std::memory_order_acq_rel))
+        return;
+
+    if (!Config::Instance()->NrWrapLists.value_or_default())
+    {
+        LOG_INFO("NrBridge: WrapLists is off -- command lists are left as the game made them");
+        return;
+    }
+
+    DlssNr::Submission::Hooks::SetProxyWrap(true);
+    DlssNr::Submission::Hooks::SetWrapOpenLists(true);
+    const auto hr = DlssNr::Submission::Hooks::Arm(device, queue);
+    LOG_INFO("NrBridge: submission hooks armed 0x{:x} on queue {}", static_cast<unsigned>(hr),
+             static_cast<void*>(queue));
+}
+
+void ReportSplitEligibility(ID3D12GraphicsCommandList* cmdList, unsigned long long n)
+{
+    const bool early = n < 6;
+    const bool periodic = (n % 600) == 0;
+    if (!early && !periodic)
+        return;
+
+    DlssNr::Submission::ILogicalCommandList* logical = nullptr;
+    const auto qi = cmdList->QueryInterface(__uuidof(DlssNr::Submission::ILogicalCommandList),
+                                            reinterpret_cast<void**>(&logical));
+    if (logical == nullptr)
+    {
+        LOG_INFO("NrBridge frame {}: list {} is not one of ours (qi 0x{:x})", n,
+                 static_cast<void*>(cmdList), static_cast<unsigned>(qi));
+        return;
+    }
+
+    const bool ineligible = logical->IsSplitIneligible();
+    const char* why = logical->SplitRejectionReason();
+    LOG_INFO("NrBridge frame {}: list {} proxied, splitIneligible={} reason={}", n,
+             static_cast<void*>(cmdList), ineligible, why != nullptr ? why : "(none)");
+    logical->Release();
+}
 
 NrBridge::Frame ReadFrame(NVSDK_NGX_Parameter* params)
 {
@@ -214,6 +265,10 @@ NrBridge::Backend* EnsureBackend(ID3D12CommandQueue* timingQueue)
         return nullptr;
     }
 
+    // Before anything else is built: the lists the game makes from now on can be cut, the one
+    // it is recording now cannot.
+    EnsureSubmissionArmed(device, queue);
+
     auto* backend = new NrBridge::Backend(device, queue, Util::DllPath().parent_path());
     g_backend.store(backend, std::memory_order_release);
     LOG_INFO("NrBridge: backend created on queue {}", static_cast<void*>(queue));
@@ -279,6 +334,12 @@ void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramet
 
     const Frame f = ReadFrame(params);
     LogFrame(f);
+
+    // Asked before anything is recorded, and answered by the list itself rather than assumed:
+    // a game that evaluates inside a render pass cannot be cut, and finding that out here costs
+    // one log line instead of a hung device.
+    if (cmdList != nullptr)
+        ReportSplitEligibility(cmdList, n);
 
     if (!Config::Instance()->NrRunBeforeSR.value_or_default())
         return;
