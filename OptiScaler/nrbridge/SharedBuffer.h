@@ -92,6 +92,18 @@ struct SharedBuffer
 
     bool Create(ID3D12Device* d3d, UINT64 bytes, std::string& why)
     {
+        auto& vk = VulkanGap::TheBridge();
+
+        // Everything below names Vulkan objects, so it cannot be attempted before there is a
+        // Vulkan device to name them on: the hand-over comes up when the slot first runs, which
+        // is later than the first frame is recorded. A frame whose buffers cannot be made is a
+        // frame passed through, not a frame worth a null handle.
+        if (!vk.ready || vk.device == VK_NULL_HANDLE || vk.memoryHandleProperties == nullptr)
+        {
+            why = "the hand-over is not up yet";
+            return false;
+        }
+
         if (bytes == 0)
         {
             why = "a shared buffer of no bytes";
@@ -137,8 +149,6 @@ struct SharedBuffer
             why = text;
             return false;
         }
-
-        auto& vk = VulkanGap::TheBridge();
 
         VkExternalMemoryBufferCreateInfo external { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;

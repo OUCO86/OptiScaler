@@ -621,6 +621,16 @@ NrBridge::Backend* EnsureBackend(ID3D12CommandQueue* timingQueue)
     // it is recording now cannot.
     EnsureSubmissionArmed(device, queue);
 
+    // The hand-over first, before the backend records a frame. The frame's buffers are named on
+    // the Vulkan device, so they can only be made once there is one, and this device already
+    // exists here while the slot -- which is where this used to be built, on its first run --
+    // has not run yet. A failure is not fatal and not final: the slot builds it again if it
+    // gets there, and until then frames go through untouched.
+    std::string why;
+    if (!VulkanGap::Create(device, why))
+        LOG_WARN("NrBridge: the Vulkan hand-over is not up yet ({}): frames go through until the slot can build it",
+                 why);
+
     auto* backend = new NrBridge::Backend(device, queue, Util::DllPath().parent_path());
     g_backend.store(backend, std::memory_order_release);
     LOG_INFO("NrBridge: backend created on queue {}", static_cast<void*>(queue));
