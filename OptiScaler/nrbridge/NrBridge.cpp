@@ -823,7 +823,17 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
     // in the continuation half, which the game's queue does not reach until the slot's submit
     // has signalled. What comes back out of the buffer is the slot's copy, which for now is
     // the frame's own colour -- the reference's Passthrough, in the network's place.
-    if (haveBuffers && p->result != nullptr)
+    //
+    // Only for a frame that was actually split. The slot is what fills the buffer this reads
+    // back from, and the slot is only run for a list that was split: for one that was not,
+    // nothing has written that buffer, and handing the result over would hand over whatever
+    // it held before -- which, on the frames before the first successful cut, is nothing at
+    // all. The game's opening menu is spent on exactly those frames (a minute of them in the
+    // run of 2026-10-13, every one of them S_FALSE: the lists are made before the swapchain
+    // is, and that is when the host starts wrapping them), and it came up black for it. A
+    // frame that was not split is passed through, which is what the reference's null answer
+    // is for.
+    if (hr == S_OK && haveBuffers && p->result != nullptr)
     {
         CopyFromBuffer(cmd, p->result.Get(), p->output.resource.Get(), p->footprint, w, h, f.colourState,
                        p->resultState);
