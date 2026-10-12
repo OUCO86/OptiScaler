@@ -174,13 +174,16 @@ void EnsureSubmissionArmed(ID3D12Device* device, ID3D12CommandQueue* queue)
 // read zero either way, because the reference's BetweenThunk returns before it counts anything
 // when the pending is empty.
 //
-// What goes in now is a probe, and it is deliberately the least a probe can be: one command list
-// of our own on the queue the game is already submitting to, copying a counter out of an upload
-// buffer we own into a buffer we own. It reads nothing the game made and writes nothing the game
-// will read, so there is no resource state to guess and no way for it to change the picture. The
-// question it answers is only whether the slot runs at all, and what a submission there costs.
-constexpr UINT GapSlotCount = 3;
-constexpr UINT64 GapPayloadBytes = 256;
+// What goes in now is a probe, and it is the reference's own shape, not a smaller version of a
+// different one. Its between work never executes a command list in the slot -- its comment is
+// verbatim "an ExecuteCommandLists from here would re-enter the game's detoured one" -- it
+// signals a D3D12 fence on the game's queue and gives the work to the Vulkan queue. The signal
+// alone is the least that keeps that shape: a queue command that touches no resource, knows no
+// resource state, and whose value a CPU thread can read. Two earlier attempts submitted a
+// command list of our own here and both removed the device on the first slot run, which is the
+// reference's warning taken as fact rather than as advice. The question the probe answers is
+// still the same -- does the slot run, and what does standing in it cost.
+constexpr UINT64 GapFenceBase = 1;
 
 // Stands in for the reference's job handle until there is a job. Its own handles are odd, so
 // never null and never a pointer, and BetweenThunk refuses to call in with a null session or
@@ -192,17 +195,10 @@ void* GapJobHandle(unsigned long long serial)
 
 struct Gap
 {
-    std::mutex mutex;
     Microsoft::WRL::ComPtr<ID3D12Device> device;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocators[GapSlotCount];
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> lists[GapSlotCount];
-    Microsoft::WRL::ComPtr<ID3D12Resource> staging;
-    Microsoft::WRL::ComPtr<ID3D12Resource> target;
-    void* mapped = nullptr;
     Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-    UINT64 signalled[GapSlotCount] {};
-    UINT64 nextFence = 1;
-    unsigned next = 0;
+    UINT64 nextValue = GapFenceBase;
+    std::atomic<UINT64> signalled { 0 };
     bool ready = false;
     const char* failure = "";
 
@@ -225,71 +221,6 @@ bool BuildGap(ID3D12Device* device)
 {
     Gap& g = TheGap();
 
-    for (UINT i = 0; i < GapSlotCount; ++i)
-    {
-        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                  IID_PPV_ARGS(&g.allocators[i]))))
-        {
-            g.failure = "CreateCommandAllocator";
-            return false;
-        }
-    }
-
-    // Created the ordinary way, not through the reference's own CreateProxiedCommandList: the
-    // lists the game makes are wrapped so that they can be cut, and this one must not be.
-    for (UINT i = 0; i < GapSlotCount; ++i)
-    {
-        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.allocators[i].Get(), nullptr,
-                                             IID_PPV_ARGS(&g.lists[i]))))
-        {
-            g.failure = "CreateCommandList";
-            return false;
-        }
-        g.lists[i]->Close();
-    }
-
-    D3D12_HEAP_PROPERTIES uploadHeap {};
-    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-    D3D12_RESOURCE_DESC payload {};
-    payload.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    payload.Width = GapPayloadBytes;
-    payload.Height = 1;
-    payload.DepthOrArraySize = 1;
-    payload.MipLevels = 1;
-    payload.SampleDesc.Count = 1;
-    payload.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-    // The staging buffer is mapped once and written from the CPU every frame. An upload heap
-    // is what makes that legal without a copy of its own.
-    if (FAILED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &payload,
-                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                               IID_PPV_ARGS(&g.staging))))
-    {
-        g.failure = "CreateCommittedResource(staging)";
-        return false;
-    }
-
-    if (FAILED(g.staging->Map(0, nullptr, &g.mapped)))
-    {
-        g.failure = "Map(staging)";
-        return false;
-    }
-
-    // The copy target is an upload-heap buffer too, and that is not laziness but the lesson of
-    // the first attempt: a default-heap buffer decays to COMMON after every ExecuteCommandLists,
-    // so a second copy into it would need a COMMON to COPY_DEST barrier first, and a copy
-    // recorded without one is an invalid call that removes the device. An upload heap's
-    // GENERIC_READ includes COPY_DEST and never decays, so the copy is legal every frame with
-    // no barrier recorded and no state to track.
-    if (FAILED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &payload,
-                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                               IID_PPV_ARGS(&g.target))))
-    {
-        g.failure = "CreateCommittedResource(target)";
-        return false;
-    }
-
     if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence))))
     {
         g.failure = "CreateFence";
@@ -308,19 +239,11 @@ int32_t EnqueueGap(void*, void* job, void* command_queue)
 
     Gap& g = TheGap();
     const auto started = std::chrono::steady_clock::now();
-
-    std::lock_guard<std::mutex> lock(g.mutex);
-
-    if (g.failure[0] != 0)
-    {
-        g.failures.fetch_add(1, std::memory_order_relaxed);
-        return -1;
-    }
+    auto* queue = static_cast<ID3D12CommandQueue*>(command_queue);
 
     if (!g.ready)
     {
-        auto* queue = static_cast<ID3D12CommandQueue*>(command_queue);
-        if (queue == nullptr || FAILED(queue->GetDevice(IID_PPV_ARGS(&g.device))))
+        if (FAILED(queue->GetDevice(IID_PPV_ARGS(&g.device))))
         {
             g.failure = "GetDevice";
             g.failures.fetch_add(1, std::memory_order_relaxed);
@@ -333,68 +256,24 @@ int32_t EnqueueGap(void*, void* job, void* command_queue)
         }
     }
 
-    g.runs.fetch_add(1, std::memory_order_relaxed);
+    const unsigned long long run = g.runs.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool announce = run <= 20;
 
-    // Every run is logged for the first twenty, because a probe that kills the device on its
-    // second or third execution dies before the periodic counters ever print. After twenty the
-    // slot is either proven or it has already failed loudly somewhere else.
-    const auto runsNow = g.runs.load(std::memory_order_relaxed);
-    const bool announce = runsNow <= 20;
+    // The signal the reference itself queues in this position: after its producer half and
+    // before its continuation half, RunNetwork calls producer->Signal on the game's queue to
+    // hand the frame to the Vulkan side. Ours carries no work with it yet, so the fence's only
+    // reader is this host: a value that climbs means the call ran, and the same value read back
+    // through GetCompletedValue means the GPU reached the gap the call enqueued.
+    const UINT64 value = g.nextValue++;
+    const HRESULT hr = queue->Signal(g.fence.Get(), value);
+    g.signalled.store(value, std::memory_order_relaxed);
 
-    const unsigned slot = g.next++ % GapSlotCount;
-
-    // The allocator cannot be reset while the GPU still has the last frame's copy queued on it,
-    // which is why there is a ring and a fence: three deep, the wait is normally already past.
-    if (g.signalled[slot] != 0 && g.fence->GetCompletedValue() < g.signalled[slot])
+    if (FAILED(hr))
     {
-        const HANDLE wait = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (wait != nullptr)
-        {
-            g.fence->SetEventOnCompletion(g.signalled[slot], wait);
-            WaitForSingleObject(wait, 2000);
-            CloseHandle(wait);
-        }
-    }
-
-    auto* allocator = g.allocators[slot].Get();
-    auto* list = g.lists[slot].Get();
-
-    if (FAILED(allocator->Reset()))
-    {
+        g.failure = "Signal";
         g.failures.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
-
-    if (FAILED(list->Reset(allocator, nullptr)))
-    {
-        g.failures.fetch_add(1, std::memory_order_relaxed);
-        return -1;
-    }
-
-    const unsigned long long serial = g.runs.load(std::memory_order_relaxed);
-    std::memcpy(g.mapped, &serial, sizeof(serial));
-    list->CopyBufferRegion(g.target.Get(), 0, g.staging.Get(), 0, GapPayloadBytes);
-
-    if (FAILED(list->Close()))
-    {
-        g.failures.fetch_add(1, std::memory_order_relaxed);
-        return -1;
-    }
-
-    ID3D12CommandList* batch[] = { list };
-
-    // Submitted through the trampoline the reference keeps for exactly this: the game's Execute
-    // is the call that got us here, and going back through the hook would expand the list that
-    // is being expanded.
-    auto* raw = DlssNr::Submission::g_rawExecuteCommandLists;
-    if (raw != nullptr)
-        raw(static_cast<ID3D12CommandQueue*>(command_queue), 1, batch);
-    else
-        static_cast<ID3D12CommandQueue*>(command_queue)->ExecuteCommandLists(1, batch);
-
-    const UINT64 signal = g.nextFence++;
-    static_cast<ID3D12CommandQueue*>(command_queue)->Signal(g.fence.Get(), signal);
-    g.signalled[slot] = signal;
 
     g.submits.fetch_add(1, std::memory_order_relaxed);
 
@@ -406,8 +285,7 @@ int32_t EnqueueGap(void*, void* job, void* command_queue)
     }
 
     if (announce)
-        LOG_INFO("NrBridge gap run #{}: queue={} slot={} fence={} took={:.3f}ms", runsNow, command_queue,
-                 slot, signal, ms);
+        LOG_INFO("NrBridge gap run #{}: queue={} value={} took={:.3f}ms", run, command_queue, value, ms);
 
     return 0;
 }
@@ -537,14 +415,22 @@ void LogFrame(const NrBridge::Frame& f)
     // call into the function, skippedHits for a run that found nothing to do.
     auto& pending = DlssNr::Backend::LmxxfCut::Pending();
     Gap& gap = TheGap();
+
+    // The GPU half of the proof: the value the last slot run queued, and the value the GPU has
+    // actually reached. Done >= signalled says the queue carried the gap's signal out in order,
+    // not just that the CPU call happened.
+    const UINT64 done = gap.fence != nullptr ? gap.fence->GetCompletedValue() : 0;
+    const UINT64 signalled = gap.signalled.load(std::memory_order_relaxed);
+
     LOG_INFO("NrBridge gap: between={} enqueue={} skipped={} | runs={} submits={} failures={} cpu={:.3f}ms "
-             "max={:.3f}ms{}",
+             "max={:.3f}ms{} gpuDone={} gapSignalled={}",
              pending.betweenHits.load(std::memory_order_relaxed),
              pending.enqueueCalls.load(std::memory_order_relaxed),
              pending.skippedHits.load(std::memory_order_relaxed),
              gap.runs.load(std::memory_order_relaxed), gap.submits.load(std::memory_order_relaxed),
              gap.failures.load(std::memory_order_relaxed), gap.cpuTotalMs.load(std::memory_order_relaxed),
-             gap.cpuMaxMs.load(std::memory_order_relaxed), gap.failure[0] != 0 ? gap.failure : "");
+             gap.cpuMaxMs.load(std::memory_order_relaxed), gap.failure[0] != 0 ? gap.failure : "",
+             done, signalled);
 }
 
 // Built on first use and never rebuilt, matching the reference: it builds what it needs on first
