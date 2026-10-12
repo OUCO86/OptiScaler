@@ -134,26 +134,6 @@ class Backend
     UINT64 RecordedFrames() const;
 };
 
-// Where the host wires the submission hooks in. The reference arms at the device -- its own
-// log lines are "HookToDevice lmxxf SubmissionHooks::ArmCreate failed" and "HookToDevice lmxxf
-// early executable proxy" -- and lets an existing queue hook carry the expansion rather than
-// detouring ExecuteCommandLists a second time:
-//
-//     // Product path: wrap CreateCommandList only. Execute expand rides AmdBridge's existing
-//     // queue ExecuteCommandLists hook (no second Detour).
-//
-// This host has that kind of hook already, in resource_tracking/ResTrack_dx12.cpp. These three
-// are the seams it uses, and none of them carries behaviour of its own.
-void HookToDevice(ID3D12Device* device);
-// The un-detoured ExecuteCommandLists, so the two halves of a cut list do not go back through
-// the hook that is expanding them.
-void NoteRawExecute(void (STDMETHODCALLTYPE* raw)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*));
-// Expands a batch: cut lists are executed in two halves with the between slot between them,
-// everything else stays in the single Execute the game asked for. Returns false when the hooks
-// are not armed, in which case the caller must submit the batch itself.
-bool ExpandSubmission(ID3D12CommandQueue* queue, UINT num, ID3D12CommandList* const* lists,
-                      void (STDMETHODCALLTYPE* raw)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*));
-
 // Runs the pass over Color immediately before Super Resolution consumes it. Safe to call every
 // frame; it builds what it needs on first use and disables itself for the session if anything
 // fails, rather than retrying into a crash. Color is returned in its original readable state.

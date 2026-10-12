@@ -136,15 +136,10 @@ std::atomic<unsigned long long> g_splitFailed { 0 };
 // before it shows up anywhere else.
 std::atomic<HRESULT> g_lastCutHr { S_OK };
 
-// Enabling the proxy wrap is the reference's swapchain step, and it is a separate step from
-// arming on purpose:
-//
-//     // Product: ProxyWrap starts OFF; swapchain ctor enables it (Streamline-safe).
-//
-// Wrapping every call, including the ones from vendor modules, is what arming at the device
-// deliberately does not do. It is enabled here, where a queue is known and therefore after the
-// swapchain exists, rather than at the device.
-void EnsureProxyWrap()
+// The split can only be made on a list this host wrapped as it was created, so the wrapping
+// hook has to be in place before the game asks for another one. Nothing is cut here: this only
+// reports whether the list the game handed us is one that could be.
+void EnsureSubmissionArmed(ID3D12Device* device, ID3D12CommandQueue* queue)
 {
     if (g_hooksTried.exchange(true, std::memory_order_acq_rel))
         return;
@@ -156,7 +151,17 @@ void EnsureProxyWrap()
     }
 
     DlssNr::Submission::Hooks::SetProxyWrap(true);
-    LOG_INFO("NrBridge: proxy wrap on -- lists the game makes from now on can be cut");
+    DlssNr::Submission::Hooks::SetWrapOpenLists(true);
+    const auto hr = DlssNr::Submission::Hooks::Arm(device, queue);
+    LOG_INFO("NrBridge: submission hooks armed 0x{:x} on queue {}", static_cast<unsigned>(hr),
+             static_cast<void*>(queue));
+
+    // The between slot is where the reference's own renderer is invoked, in the gap between the
+    // two halves of a cut list. It is armed here rather than at the cut: the reference does the
+    // same (ArmBetweenSlot installs BetweenThunk), and with nothing enqueued the thunk finds an
+    // empty pending and returns, which is what makes the cut itself measurable on its own.
+    if (SUCCEEDED(hr))
+        DlssNr::Backend::LmxxfCut::ArmBetweenSlot();
 }
 
 void ReportSplitEligibility(ID3D12GraphicsCommandList* cmdList, unsigned long long n)
@@ -313,7 +318,7 @@ NrBridge::Backend* EnsureBackend(ID3D12CommandQueue* timingQueue)
 
     // Before anything else is built: the lists the game makes from now on can be cut, the one
     // it is recording now cannot.
-    EnsureProxyWrap();
+    EnsureSubmissionArmed(device, queue);
 
     auto* backend = new NrBridge::Backend(device, queue, Util::DllPath().parent_path());
     g_backend.store(backend, std::memory_order_release);
@@ -428,51 +433,6 @@ void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramet
 
     if (n == 5)
         LOG_INFO("NrBridge: recorded {} frames", backend->RecordedFrames());
-}
-
-void HookToDevice(ID3D12Device* device)
-{
-    if (device == nullptr || !DlssNr::Backend::SubmissionHooksWanted())
-        return;
-
-    DlssNr::Submission::Hooks::SetWrapOpenLists(true);
-
-    // The reference's rule for auto, from its own documentation: "Auto admits early EXE calls
-    // in Unreal/Forza". This game is Unreal, so auto is on here, and the setting exists to turn
-    // it off because forcing it on "can break initialization in untested games".
-    const bool earlyExe = Config::Instance()->NrEarlyExeWrap.value_or(IsUnreal());
-    DlssNr::Submission::Hooks::SetEarlyExeWrap(earlyExe);
-
-    const HRESULT hr = DlssNr::Submission::Hooks::ArmCreate(device);
-    if (FAILED(hr))
-    {
-        LOG_WARN("NrBridge: lmxxf SubmissionHooks::ArmCreate failed: {:X}", static_cast<unsigned>(hr));
-        return;
-    }
-
-    // The between slot is where the reference's own renderer is invoked, in the gap between the
-    // two halves of a cut list. With nothing enqueued the thunk finds an empty pending and
-    // returns, which is what makes the cut itself measurable on its own.
-    DlssNr::Backend::LmxxfCut::ArmBetweenSlot();
-    LOG_INFO("NrBridge: lmxxf early executable proxy: {} (submission hook ready={})", earlyExe,
-             DlssNr::Submission::Hooks::IsArmed());
-}
-
-void NoteRawExecute(void (STDMETHODCALLTYPE* raw)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))
-{
-    DlssNr::Submission::NoteRawExecuteCommandLists(raw);
-}
-
-bool ExpandSubmission(ID3D12CommandQueue* queue, UINT num, ID3D12CommandList* const* lists,
-                      void (STDMETHODCALLTYPE* raw)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*))
-{
-    if (!DlssNr::Submission::Hooks::IsArmed() || !DlssNr::Submission::Hooks::ExpandEnabled() ||
-        raw == nullptr)
-        return false;
-
-    const auto between = DlssNr::Submission::Hooks::GetBetween();
-    DlssNr::Submission::Hooks::ExecuteExpanded(queue, num, lists, between.fn, between.ctx, raw);
-    return true;
 }
 
 void Shutdown()

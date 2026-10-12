@@ -6,7 +6,6 @@
 #include <Util.h>
 
 #include <menu/menu_overlay_dx.h>
-#include <nrbridge/NrBridge.h>
 
 #include <algorithm>
 #include <future>
@@ -810,16 +809,7 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
 
     LOG_TRACK("Done NumCommandLists: {}", NumCommandLists);
 
-    // The reference's product path does not detour ExecuteCommandLists a second time; it lets
-    // an existing queue hook carry the expansion. This is that hook.
-    //
-    //   // Product path: wrap CreateCommandList only. Execute expand rides AmdBridge's existing
-    //   // queue ExecuteCommandLists hook (no second Detour).
-    //
-    // Uncut batches go through in the single Execute the game asked for, so nothing changes for
-    // them. Returns false when the submission hooks are not armed, which is the ordinary case.
-    if (!NrBridge::ExpandSubmission(This, NumCommandLists, ppCommandLists, o_ExecuteCommandLists))
-        o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
+    o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
 }
 
 #pragma region Heap hooks
@@ -2087,13 +2077,6 @@ void ResTrack_Dx12::HookToQueue(ID3D12Device* InDevice)
         {
             LOG_ERROR("Failed to hook CommandList methods: {:X}", detourResult);
             o_ExecuteCommandLists = nullptr;
-        }
-        else
-        {
-            // After DetourAttach this points at the trampoline, which is the submit path that
-            // does not come back through hkExecuteCommandLists. The two halves of a cut list
-            // have to be submitted that way, or expanding them would expand them again.
-            NrBridge::NoteRawExecute(o_ExecuteCommandLists);
         }
 
         queue->Release();
