@@ -48,4 +48,17 @@ struct Frame
 // Read what this evaluate offers and log it. Touches no resource and records no command.
 // Safe to call on every evaluate; it prints the first few frames and then only occasionally.
 void ProbeBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params);
+
+// Stage two, and the reason it exists: a resource handle that is present is not the same
+// claim as a texture carrying numbers. This copies the motion vectors to a readback buffer
+// on the game's own command list and prints a handful of values from the middle of the
+// picture, once, so the vectors are shown to hold something rather than merely to exist.
+//
+// It is also the first thing this module does that records a command, which is the same
+// machinery a write-back will need -- the barriers, the queue, the wait. Better to find out
+// here that any of it is wrong, while the only consequence is a missing number.
+//
+// Runs on at most the first few frames and then latches off, permanently, on any failure or
+// timeout. It never blocks for more than a fraction of a second and never retries.
+void SampleMotionOnce(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params);
 } // namespace NrBridge

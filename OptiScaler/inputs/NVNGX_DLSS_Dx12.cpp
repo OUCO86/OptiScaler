@@ -945,7 +945,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     // Our bridge reads this evaluate before the upscaler consumes it. Stage one reports only:
     // it must be shown to receive the vectors before it is allowed to touch a pixel.
     if (Config::Instance()->NrBridgeProbe.value_or_default())
+    {
         NrBridge::ProbeBeforeUpscale(InCmdList, InParameters);
+        NrBridge::SampleMotionOnce(InCmdList, InParameters);
+    }
 
     // Run upscaler
     {
