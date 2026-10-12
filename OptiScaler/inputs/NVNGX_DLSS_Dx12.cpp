@@ -947,7 +947,6 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     if (Config::Instance()->NrBridgeProbe.value_or_default())
     {
         NrBridge::ProbeBeforeUpscale(InCmdList, InParameters);
-        NrBridge::SampleMotionOnce(InCmdList, InParameters);
     }
 
     // Run upscaler
