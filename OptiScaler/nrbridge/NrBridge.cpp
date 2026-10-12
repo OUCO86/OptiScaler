@@ -250,8 +250,6 @@ bool BuildGap(ID3D12Device* device)
 
     D3D12_HEAP_PROPERTIES uploadHeap {};
     uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_HEAP_PROPERTIES defaultHeap {};
-    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
     D3D12_RESOURCE_DESC payload {};
     payload.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -278,10 +276,14 @@ bool BuildGap(ID3D12Device* device)
         return false;
     }
 
-    // The target is created in COPY_DEST and never leaves it, so no barrier has to be recorded
-    // for it and no state has to be known. That is the whole reason the probe is shaped this way.
-    if (FAILED(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &payload,
-                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+    // The copy target is an upload-heap buffer too, and that is not laziness but the lesson of
+    // the first attempt: a default-heap buffer decays to COMMON after every ExecuteCommandLists,
+    // so a second copy into it would need a COMMON to COPY_DEST barrier first, and a copy
+    // recorded without one is an invalid call that removes the device. An upload heap's
+    // GENERIC_READ includes COPY_DEST and never decays, so the copy is legal every frame with
+    // no barrier recorded and no state to track.
+    if (FAILED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &payload,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                IID_PPV_ARGS(&g.target))))
     {
         g.failure = "CreateCommittedResource(target)";
