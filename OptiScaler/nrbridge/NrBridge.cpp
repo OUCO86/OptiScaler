@@ -7,6 +7,7 @@
 #include "Util.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -164,6 +165,241 @@ void EnsureSubmissionArmed(ID3D12Device* device, ID3D12CommandQueue* queue)
         DlssNr::Backend::LmxxfCut::ArmBetweenSlot();
 }
 
+// The gap between the two halves of a cut list. This is where the reference runs its renderer:
+// its backend records the network's inputs, cuts the list, and the runtime's CoreEnqueueHip is
+// called in the gap, before the outputs are recorded and the upscaler is handed the result.
+//
+// No renderer is attached yet, so nothing has ever been enqueued and the slot has never had
+// anything to do -- which is why the previous step could not tell whether it ran. Its counters
+// read zero either way, because the reference's BetweenThunk returns before it counts anything
+// when the pending is empty.
+//
+// What goes in now is a probe, and it is deliberately the least a probe can be: one command list
+// of our own on the queue the game is already submitting to, copying a counter out of an upload
+// buffer we own into a buffer we own. It reads nothing the game made and writes nothing the game
+// will read, so there is no resource state to guess and no way for it to change the picture. The
+// question it answers is only whether the slot runs at all, and what a submission there costs.
+constexpr UINT GapSlotCount = 3;
+constexpr UINT64 GapPayloadBytes = 256;
+
+// Stands in for the reference's job handle until there is a job. Its own handles are odd, so
+// never null and never a pointer, and BetweenThunk refuses to call in with a null session or
+// job -- it counts a skip and returns without running anything.
+void* GapJobHandle(unsigned long long serial)
+{
+    return reinterpret_cast<void*>(static_cast<uintptr_t>((serial << 1) | 1));
+}
+
+struct Gap
+{
+    std::mutex mutex;
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocators[GapSlotCount];
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> lists[GapSlotCount];
+    Microsoft::WRL::ComPtr<ID3D12Resource> staging;
+    Microsoft::WRL::ComPtr<ID3D12Resource> target;
+    void* mapped = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    UINT64 signalled[GapSlotCount] {};
+    UINT64 nextFence = 1;
+    unsigned next = 0;
+    bool ready = false;
+    const char* failure = "";
+
+    std::atomic<unsigned long long> runs { 0 };
+    std::atomic<unsigned long long> submits { 0 };
+    std::atomic<unsigned long long> failures { 0 };
+    std::atomic<double> cpuTotalMs { 0.0 };
+    std::atomic<double> cpuMaxMs { 0.0 };
+};
+
+Gap& TheGap()
+{
+    // Process lifetime owner, the same way the reference keeps its Pending(): it is not torn
+    // down while the game still has threads recording.
+    static Gap g;
+    return g;
+}
+
+bool BuildGap(ID3D12Device* device)
+{
+    Gap& g = TheGap();
+
+    for (UINT i = 0; i < GapSlotCount; ++i)
+    {
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                  IID_PPV_ARGS(&g.allocators[i]))))
+        {
+            g.failure = "CreateCommandAllocator";
+            return false;
+        }
+    }
+
+    // Created the ordinary way, not through the reference's own CreateProxiedCommandList: the
+    // lists the game makes are wrapped so that they can be cut, and this one must not be.
+    for (UINT i = 0; i < GapSlotCount; ++i)
+    {
+        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.allocators[i].Get(), nullptr,
+                                             IID_PPV_ARGS(&g.lists[i]))))
+        {
+            g.failure = "CreateCommandList";
+            return false;
+        }
+        g.lists[i]->Close();
+    }
+
+    D3D12_HEAP_PROPERTIES uploadHeap {};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_HEAP_PROPERTIES defaultHeap {};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC payload {};
+    payload.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    payload.Width = GapPayloadBytes;
+    payload.Height = 1;
+    payload.DepthOrArraySize = 1;
+    payload.MipLevels = 1;
+    payload.SampleDesc.Count = 1;
+    payload.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    // The staging buffer is mapped once and written from the CPU every frame. An upload heap
+    // is what makes that legal without a copy of its own.
+    if (FAILED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &payload,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                               IID_PPV_ARGS(&g.staging))))
+    {
+        g.failure = "CreateCommittedResource(staging)";
+        return false;
+    }
+
+    if (FAILED(g.staging->Map(0, nullptr, &g.mapped)))
+    {
+        g.failure = "Map(staging)";
+        return false;
+    }
+
+    // The target is created in COPY_DEST and never leaves it, so no barrier has to be recorded
+    // for it and no state has to be known. That is the whole reason the probe is shaped this way.
+    if (FAILED(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &payload,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&g.target))))
+    {
+        g.failure = "CreateCommittedResource(target)";
+        return false;
+    }
+
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence))))
+    {
+        g.failure = "CreateFence";
+        return false;
+    }
+
+    g.ready = true;
+    return true;
+}
+
+// The reference's EnqueueHipFn, called by BetweenThunk between the two halves.
+int32_t EnqueueGap(void*, void* job, void* command_queue)
+{
+    if (job == nullptr || command_queue == nullptr)
+        return -1;
+
+    Gap& g = TheGap();
+    const auto started = std::chrono::steady_clock::now();
+
+    std::lock_guard<std::mutex> lock(g.mutex);
+
+    if (g.failure[0] != 0)
+    {
+        g.failures.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+
+    if (!g.ready)
+    {
+        auto* queue = static_cast<ID3D12CommandQueue*>(command_queue);
+        if (queue == nullptr || FAILED(queue->GetDevice(IID_PPV_ARGS(&g.device))))
+        {
+            g.failure = "GetDevice";
+            g.failures.fetch_add(1, std::memory_order_relaxed);
+            return -1;
+        }
+        if (!BuildGap(g.device.Get()))
+        {
+            g.failures.fetch_add(1, std::memory_order_relaxed);
+            return -1;
+        }
+    }
+
+    g.runs.fetch_add(1, std::memory_order_relaxed);
+
+    const unsigned slot = g.next++ % GapSlotCount;
+
+    // The allocator cannot be reset while the GPU still has the last frame's copy queued on it,
+    // which is why there is a ring and a fence: three deep, the wait is normally already past.
+    if (g.signalled[slot] != 0 && g.fence->GetCompletedValue() < g.signalled[slot])
+    {
+        const HANDLE wait = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (wait != nullptr)
+        {
+            g.fence->SetEventOnCompletion(g.signalled[slot], wait);
+            WaitForSingleObject(wait, 2000);
+            CloseHandle(wait);
+        }
+    }
+
+    auto* allocator = g.allocators[slot].Get();
+    auto* list = g.lists[slot].Get();
+
+    if (FAILED(allocator->Reset()))
+    {
+        g.failures.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+
+    if (FAILED(list->Reset(allocator, nullptr)))
+    {
+        g.failures.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+
+    const unsigned long long serial = g.runs.load(std::memory_order_relaxed);
+    std::memcpy(g.mapped, &serial, sizeof(serial));
+    list->CopyBufferRegion(g.target.Get(), 0, g.staging.Get(), 0, GapPayloadBytes);
+
+    if (FAILED(list->Close()))
+    {
+        g.failures.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+
+    ID3D12CommandList* batch[] = { list };
+
+    // Submitted through the trampoline the reference keeps for exactly this: the game's Execute
+    // is the call that got us here, and going back through the hook would expand the list that
+    // is being expanded.
+    auto* raw = DlssNr::Submission::g_rawExecuteCommandLists;
+    if (raw != nullptr)
+        raw(static_cast<ID3D12CommandQueue*>(command_queue), 1, batch);
+    else
+        static_cast<ID3D12CommandQueue*>(command_queue)->ExecuteCommandLists(1, batch);
+
+    const UINT64 signal = g.nextFence++;
+    static_cast<ID3D12CommandQueue*>(command_queue)->Signal(g.fence.Get(), signal);
+    g.signalled[slot] = signal;
+
+    g.submits.fetch_add(1, std::memory_order_relaxed);
+
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    g.cpuTotalMs.store(g.cpuTotalMs.load(std::memory_order_relaxed) + ms, std::memory_order_relaxed);
+    double peak = g.cpuMaxMs.load(std::memory_order_relaxed);
+    while (ms > peak && !g.cpuMaxMs.compare_exchange_weak(peak, ms, std::memory_order_relaxed))
+    {
+    }
+
+    return 0;
+}
+
 void ReportSplitEligibility(ID3D12GraphicsCommandList* cmdList, unsigned long long n)
 {
     const bool early = n < 6;
@@ -283,6 +519,20 @@ void LogFrame(const NrBridge::Frame& f)
              DlssNr::Submission::g_splitSubmissions.load(std::memory_order_relaxed),
              DlssNr::Submission::g_continuationSubmissions.load(std::memory_order_relaxed),
              DlssNr::Submission::g_submissionFailures.load(std::memory_order_relaxed));
+
+    // Whether the slot runs at all. Its own counts come from the reference's Pending(), which
+    // BetweenThunk fills in: betweenHits for a run whose list matched, enqueueCalls for the
+    // call into the function, skippedHits for a run that found nothing to do.
+    auto& pending = DlssNr::Backend::LmxxfCut::Pending();
+    Gap& gap = TheGap();
+    LOG_INFO("NrBridge gap: between={} enqueue={} skipped={} | runs={} submits={} failures={} cpu={:.3f}ms "
+             "max={:.3f}ms{}",
+             pending.betweenHits.load(std::memory_order_relaxed),
+             pending.enqueueCalls.load(std::memory_order_relaxed),
+             pending.skippedHits.load(std::memory_order_relaxed),
+             gap.runs.load(std::memory_order_relaxed), gap.submits.load(std::memory_order_relaxed),
+             gap.failures.load(std::memory_order_relaxed), gap.cpuTotalMs.load(std::memory_order_relaxed),
+             gap.cpuMaxMs.load(std::memory_order_relaxed), gap.failure[0] != 0 ? gap.failure : "");
 }
 
 // Built on first use and never rebuilt, matching the reference: it builds what it needs on first
@@ -363,7 +613,17 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
     const HRESULT hr = DlssNr::Backend::LmxxfCut::TrySplitAtEvaluate(cmd);
     g_lastCutHr.store(hr, std::memory_order_relaxed);
     if (hr == S_OK)
+    {
         g_splitOk.fetch_add(1, std::memory_order_relaxed);
+
+        // Arm the slot for this list, in the same place the reference does it: its
+        // LmxxfBackend::Record sets the pending enqueue after the cut, between the calls
+        // that record the network's inputs and its outputs. BetweenThunk then calls the
+        // function once, when the cut list reaches the queue, between its two halves.
+        const auto serial = g_splitOk.load(std::memory_order_relaxed);
+        DlssNr::Backend::LmxxfCut::SetPendingEnqueue(this, GapJobHandle(serial), &EnqueueGap, nullptr,
+                                                     static_cast<ID3D12CommandList*>(cmd), nullptr);
+    }
     else if (hr == S_FALSE)
         g_splitNoProxy.fetch_add(1, std::memory_order_relaxed);
     else
