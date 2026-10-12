@@ -211,6 +211,7 @@ struct Gap
     std::atomic<unsigned long long> failures { 0 };
     std::atomic<unsigned long long> vkSubmits { 0 };
     std::atomic<unsigned long long> vkFailures { 0 };
+    std::atomic<unsigned long long> waits { 0 };
     std::atomic<double> cpuTotalMs { 0.0 };
     std::atomic<double> cpuMaxMs { 0.0 };
 };
@@ -309,6 +310,22 @@ int32_t EnqueueGap(void*, void* job, void* command_queue)
 
     g.vkSubmits.fetch_add(1, std::memory_order_relaxed);
     g.submits.fetch_add(1, std::memory_order_relaxed);
+
+    // The reference closes the ring in the same callback, straight after the submit goes through:
+    // the game's queue waits for the value the Vulkan queue is going to signal. It asks for that
+    // wait only once `submitted` is true, because a Wait on a value nothing will signal stops the
+    // queue instead of slowing it -- which is why the failed-return above queues nothing.
+    const HRESULT waited = queue->Wait(vk.fromVk.Get(), value);
+    if (FAILED(waited))
+    {
+        char text[64];
+        std::snprintf(text, sizeof text, "Wait(fromVk) 0x%08lX", static_cast<unsigned long>(waited));
+        g.failure = text;
+        g.failures.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+
+    g.waits.fetch_add(1, std::memory_order_relaxed);
 
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     g.cpuTotalMs.store(g.cpuTotalMs.load(std::memory_order_relaxed) + ms, std::memory_order_relaxed);
@@ -452,9 +469,8 @@ void LogFrame(const NrBridge::Frame& f)
     // Both halves of the hand-over, read back from the fences themselves. toVk is the fence the
     // game's queue signals and Vulkan waits on: its completed value catching the last value
     // queued is the GPU reaching the gap in order. fromVk is the one Vulkan signals: its value
-    // climbing is the Vulkan queue having run and handed the frame back, which is what lets the
-    // game's queue be made to wait on it -- that Wait is the next step and is not queued yet,
-    // because a wait on a value nothing signals stops the queue instead of slowing it.
+    // climbing is the Vulkan queue having run and handed the frame back, and it is the value the
+    // game's queue is now made to wait on in the slot, which closes the ring.
     auto& vk = VulkanGap::TheBridge();
     const UINT64 toVkDone = vk.toVk != nullptr ? vk.toVk->GetCompletedValue() : 0;
     const UINT64 fromVkDone = vk.fromVk != nullptr ? vk.fromVk->GetCompletedValue() : 0;
@@ -463,13 +479,14 @@ void LogFrame(const NrBridge::Frame& f)
     // toVkDone and gapSignalled are the same fence read by its two owners; seenToVk is what
     // Vulkan makes of it. If seenToVk stays behind toVkDone, the import never shared the fence,
     // and the Vulkan side will wait for a value nothing is going to give it.
-    LOG_INFO("NrBridge gap: between={} enqueue={} skipped={} | runs={} submits={} failures={} cpu={:.3f}ms "
+    LOG_INFO("NrBridge gap: between={} enqueue={} skipped={} | runs={} submits={} waits={} failures={} cpu={:.3f}ms "
              "max={:.3f}ms{} | vk submits={} failures={}{} | toVkDone={} seenByVk={} | fromVkDone={} "
              "seenByVk={} gapSignalled={}",
              pending.betweenHits.load(std::memory_order_relaxed),
              pending.enqueueCalls.load(std::memory_order_relaxed),
              pending.skippedHits.load(std::memory_order_relaxed),
              gap.runs.load(std::memory_order_relaxed), gap.submits.load(std::memory_order_relaxed),
+             gap.waits.load(std::memory_order_relaxed),
              gap.failures.load(std::memory_order_relaxed), gap.cpuTotalMs.load(std::memory_order_relaxed),
              gap.cpuMaxMs.load(std::memory_order_relaxed), gap.failure.empty() ? "" : gap.failure.c_str(),
              gap.vkSubmits.load(std::memory_order_relaxed), gap.vkFailures.load(std::memory_order_relaxed),
