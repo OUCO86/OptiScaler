@@ -17,6 +17,15 @@
 #include "submission/CommandListProxy.h"
 #include "submission/SubmissionHooks.h"
 
+// The reference's evaluate-time cut, likewise verbatim: TrySplitAtEvaluate, the between slot
+// and the pending enqueue it consumes. It is the piece that turns "the list may be cut" into
+// a cut, and it is included rather than rewritten for the reason given in NrBridge.h.
+//
+// It sits one directory below where it is used, because that is where it sat in the reference:
+// its own includes are "Selector.h" beside it and "../submission/CommandListProxy.h" above it,
+// so it needs a sibling of submission/, not a child.
+#include "cut/LmxxfEvaluateCut.h"
+
 // The shape of everything here comes from the reference integration; see NrBridge.h. What is
 // ours is only the part that has to be: reading this host's parameter block, and resolving the
 // state each resource is actually in before anything is recorded.
@@ -116,6 +125,13 @@ std::atomic<NrBridge::Backend*> g_backend { nullptr };
 std::mutex g_backendMutex;
 std::string g_failureReason;
 
+// What the cut answered, counted as the reference's own return value means it: S_OK is a cut,
+// S_FALSE is "not a list we wrapped" (its documented meaning, not an error), anything else is
+// a refusal with a reason of its own.
+std::atomic<unsigned long long> g_splitOk { 0 };
+std::atomic<unsigned long long> g_splitNoProxy { 0 };
+std::atomic<unsigned long long> g_splitFailed { 0 };
+
 // The split can only be made on a list this host wrapped as it was created, so the wrapping
 // hook has to be in place before the game asks for another one. Nothing is cut here: this only
 // reports whether the list the game handed us is one that could be.
@@ -135,6 +151,13 @@ void EnsureSubmissionArmed(ID3D12Device* device, ID3D12CommandQueue* queue)
     const auto hr = DlssNr::Submission::Hooks::Arm(device, queue);
     LOG_INFO("NrBridge: submission hooks armed 0x{:x} on queue {}", static_cast<unsigned>(hr),
              static_cast<void*>(queue));
+
+    // The between slot is where the reference's own renderer is invoked, in the gap between the
+    // two halves of a cut list. It is armed here rather than at the cut: the reference does the
+    // same (ArmBetweenSlot installs BetweenThunk), and with nothing enqueued the thunk finds an
+    // empty pending and returns, which is what makes the cut itself measurable on its own.
+    if (SUCCEEDED(hr))
+        DlssNr::Backend::LmxxfCut::ArmBetweenSlot();
 }
 
 void ReportSplitEligibility(ID3D12GraphicsCommandList* cmdList, unsigned long long n)
@@ -232,6 +255,18 @@ void LogFrame(const NrBridge::Frame& f)
         if (f.motion == nullptr)
             LOG_WARN("NrBridge: no motion vectors in this evaluate -- temporal work must fall back");
     }
+
+    // The cut on the same cadence as the frame line, so the two can be read together. between
+    // counts every time the slot ran, enqueue counts every time it called through, and skipped
+    // counts the times it ran with nothing pending -- which, with no renderer attached, is all
+    // of them. A cut that never reaches the slot would show split climbing with between stuck.
+    auto& pending = DlssNr::Backend::LmxxfCut::Pending();
+    LOG_INFO("NrBridge cut: split={} notProxied={} refused={} | between={} enqueue={} skipped={}",
+             g_splitOk.load(std::memory_order_relaxed), g_splitNoProxy.load(std::memory_order_relaxed),
+             g_splitFailed.load(std::memory_order_relaxed),
+             pending.betweenHits.load(std::memory_order_relaxed),
+             pending.enqueueCalls.load(std::memory_order_relaxed),
+             pending.skippedHits.load(std::memory_order_relaxed));
 }
 
 // Built on first use and never rebuilt, matching the reference: it builds what it needs on first
@@ -294,10 +329,28 @@ Backend::Backend(ID3D12Device* device, ID3D12CommandQueue* queue, const std::fil
 // Nothing is recorded yet: this is the seam the renderer will be attached to, and until it is,
 // the frame the game handed over is the frame the upscaler gets. A null return is the reference's
 // own signal for "skip", so the caller's behaviour is already correct either way.
-ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList*, const Frame& f, const Settings&)
+ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Settings&)
 {
     if (f.motion == nullptr)
         return nullptr;
+
+    // The cut goes here because that is where the reference puts it, in
+    // ta_be_MochizukiBackend.cpp:
+    //
+    //     if (p->api.RecordInputs(...) != LMXXF_NR_OK ||
+    //         LmxxfCut::TrySplitAtEvaluate(cmd) != S_OK ||
+    //         p->api.RecordOutputs(...) != LMXXF_NR_OK)
+    //
+    // between recording the network's inputs and recording its outputs. There is no network
+    // attached yet, so the two calls around it do not exist and nothing is enqueued for the
+    // slot to run: what is left is the cut on its own, which is the only thing being measured.
+    const HRESULT hr = DlssNr::Backend::LmxxfCut::TrySplitAtEvaluate(cmd);
+    if (hr == S_OK)
+        g_splitOk.fetch_add(1, std::memory_order_relaxed);
+    else if (hr == S_FALSE)
+        g_splitNoProxy.fetch_add(1, std::memory_order_relaxed);
+    else
+        g_splitFailed.fetch_add(1, std::memory_order_relaxed);
 
     p->recorded.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
@@ -306,7 +359,12 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList*, const Frame& f, cons
 int Backend::PendingListIndex(UINT, ID3D12CommandList* const*) const { return -1; }
 void Backend::Submitting(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*) { }
 void Backend::TraceBoundary(const std::string&) { }
-void Backend::Submitted(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*) { }
+// The reference drops a pending enqueue once the list it was waiting for has gone to the queue,
+// so a job can never be enqueued twice by a later submission of the same list.
+void Backend::Submitted(ID3D12CommandQueue*, UINT count, ID3D12CommandList* const* lists)
+{
+    DlssNr::Backend::LmxxfCut::ClearPendingEnqueueIfSubmitted(count, lists);
+}
 bool Backend::Ready() { return true; }
 bool Backend::Shutdown() { return true; }
 void Backend::ReleaseSession() { }

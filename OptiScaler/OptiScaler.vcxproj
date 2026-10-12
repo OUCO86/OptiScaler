@@ -335,6 +335,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="spoofing\User32_Spoofing.h" />
     <ClInclude Include="hooks\VulkanwDx12_Hooks.h" />
     <ClInclude Include="nrbridge\NrBridge.h" />
+    <ClInclude Include="nrbridge\cut\LmxxfEvaluateCut.h" />
+    <ClInclude Include="nrbridge\cut\Selector.h" />
     <ClInclude Include="nrbridge\submission\CommandListProxy.h" />
     <ClInclude Include="nrbridge\submission\ContinuationState.h" />
     <ClInclude Include="nrbridge\submission\LogicalList.h" />
