@@ -154,18 +154,15 @@ void CopyToBuffer(ID3D12GraphicsCommandList* c, ID3D12Resource* texture, D3D12_R
 
 void CopyFromBuffer(ID3D12GraphicsCommandList* c, ID3D12Resource* texture, ID3D12Resource* buffer,
                     const NrBridge::Footprint& fp, UINT w, UINT h, D3D12_RESOURCE_STATES state,
-                    D3D12_RESOURCE_STATES textureNow, bool withCopy)
+                    D3D12_RESOURCE_STATES textureNow)
 {
     Transition(c, buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(c, texture, textureNow, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    if (withCopy)
-    {
-        D3D12_TEXTURE_COPY_LOCATION dst { texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {} };
-        D3D12_TEXTURE_COPY_LOCATION src { buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {} };
-        src.PlacedFootprint = fp.d3d;
-        c->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    }
+    D3D12_TEXTURE_COPY_LOCATION dst { texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {} };
+    D3D12_TEXTURE_COPY_LOCATION src { buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {} };
+    src.PlacedFootprint = fp.d3d;
+    c->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
     Transition(c, texture, D3D12_RESOURCE_STATE_COPY_DEST, state);
     Transition(c, buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -758,34 +755,6 @@ Backend::Backend(ID3D12Device* device, ID3D12CommandQueue* queue, const std::fil
 // Nothing is recorded yet: this is the seam the renderer will be attached to, and until it is,
 // the frame the game handed over is the frame the upscaler gets. A null return is the reference's
 // own signal for "skip", so the caller's behaviour is already correct either way.
-// DIAGNOSTIC, TO BE REMOVED ONCE THIS IS ANSWERED.
-// The game's Close() answers E_INVALIDARG, which means something recorded into that list was
-// refused, and nothing else here says which call: the calls return void, and D3D12's debug
-// layer stays silent about it. So each of the first frames adds one link more than the one
-// before it. The frame the game dies on names the link.
-enum class DiagStage
-{
-    Nothing,     // no command at all: the shape that is known to survive
-    Barriers,    // only the four state changes around the colour -- no pixels moved
-    CopyIn,      // plus the colour into the shared buffer
-    OutBarriers, // plus the copy-back's own state changes, on the output buffer and the result -- still no pixels
-    CopyOut,     // plus the copy itself, buffer into the result texture
-    Swap,        // plus the result handed to the upscaler as its colour
-};
-
-static const char* DiagName(DiagStage s)
-{
-    switch (s)
-    {
-    case DiagStage::Nothing: return "nothing recorded";
-    case DiagStage::Barriers: return "the barriers only, no pixels moved";
-    case DiagStage::CopyIn: return "the colour copied into the shared buffer";
-    case DiagStage::OutBarriers: return "the copy-back's barriers, no copy yet";
-    case DiagStage::CopyOut: return "the shared buffer copied back into the result";
-    case DiagStage::Swap: return "the result handed to the upscaler as its colour";
-    }
-    return "?";
-}
 
 ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Settings&)
 {
@@ -800,50 +769,20 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
     const UINT h = f.height != 0 ? f.height : static_cast<UINT>(desc.Height);
 
     const bool haveBuffers = p->BuildBuffers(f.colour, w, h);
-
-    const auto n = p->recorded.load(std::memory_order_relaxed);
-    const DiagStage stage = n == 0   ? DiagStage::Nothing
-                            : n == 1 ? DiagStage::Barriers
-                            : n == 2 ? DiagStage::CopyIn
-                            : n == 3 ? DiagStage::OutBarriers
-                            : n == 4 ? DiagStage::CopyOut
-                                     : DiagStage::Swap;
-
-    if (n < 8)
+    if (!haveBuffers)
     {
-        LOG_INFO("NrBridge diagnostic frame {}: stage {} -- {}", n, static_cast<int>(stage), DiagName(stage));
-
-        if (haveBuffers)
-        {
-            const auto rd = p->result->GetDesc();
-            LOG_INFO("NrBridge diagnostic parameters: colour {}x{} format={} flags=0x{:x} mips={} samples={} "
-                     "align={} layout={} dim={} | "
-                     "colourState=0x{:x} resultState=0x{:x} | footprint {}x{} pitch={} bytes={} format={} | "
-                     "box {}x{} | buffers input={}B output={}B | result {}x{} format={} flags=0x{:x} mips={} "
-                     "samples={} align={}",
-                     desc.Width, desc.Height, static_cast<unsigned>(desc.Format),
-                     static_cast<unsigned>(desc.Flags), desc.MipLevels, desc.SampleDesc.Count,
-                     desc.Alignment, static_cast<unsigned>(desc.Layout), static_cast<unsigned>(desc.Dimension),
-                     static_cast<unsigned>(f.colourState), static_cast<unsigned>(p->resultState),
-                     p->footprint.d3d.Footprint.Width, p->footprint.d3d.Footprint.Height,
-                     p->footprint.d3d.Footprint.RowPitch, p->footprint.bytes,
-                     static_cast<unsigned>(p->footprint.d3d.Footprint.Format), w, h, p->input.size,
-                     p->output.size, static_cast<UINT64>(rd.Width), rd.Height,
-                     static_cast<unsigned>(rd.Format), static_cast<unsigned>(rd.Flags), rd.MipLevels,
-                     rd.SampleDesc.Count, rd.Alignment);
-        }
+        // Said once: a frame without buffers is a frame passed through, which is not worth a
+        // line per frame, but the reason it has none is worth one line at all.
+        static std::atomic<bool> said { false };
+        if (!said.exchange(true, std::memory_order_relaxed))
+            LOG_WARN("NrBridge: the frame's buffers could not be made ({}): frames are passed through",
+                     p->bufferFailure);
     }
 
-    if (stage == DiagStage::Barriers && haveBuffers)
-    {
-        // The four state changes the two copies are wrapped in, on their own.
-        Transition(cmd, f.colour, f.colourState, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        Transition(cmd, p->input.resource.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        Transition(cmd, p->input.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-        Transition(cmd, f.colour, D3D12_RESOURCE_STATE_COPY_SOURCE, f.colourState);
-    }
-
-    if (stage >= DiagStage::CopyIn && haveBuffers)
+    // The reference's RecordInputs, in the reference's place: before the cut, so that it lands
+    // in the producer half and is complete before the slot's wait is satisfied. The frame's
+    // colour goes into the buffer the slot's copy reads from.
+    if (haveBuffers)
         CopyToBuffer(cmd, f.colour, f.colourState, p->input.resource.Get(), p->footprint, w, h);
 
     // The cut goes here because that is where the reference puts it, in
@@ -884,22 +823,29 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
     // in the continuation half, which the game's queue does not reach until the slot's submit
     // has signalled. What comes back out of the buffer is the slot's copy, which for now is
     // the frame's own colour -- the reference's Passthrough, in the network's place.
-    if (stage >= DiagStage::OutBarriers && haveBuffers && p->result != nullptr)
+    if (haveBuffers && p->result != nullptr)
     {
         CopyFromBuffer(cmd, p->result.Get(), p->output.resource.Get(), p->footprint, w, h, f.colourState,
-                       p->resultState, stage >= DiagStage::CopyOut);
-        p->resultState = f.colourState;
-    }
+                       p->resultState);
 
-    p->recorded.fetch_add(1, std::memory_order_relaxed);
+        // What the result is left in is not what this module left it in. It is handed to the
+        // upscaler in the state the upscaler wants the colour in, and the upscaler then
+        // barriers it out of that state and into the one it reads it in, which on this host's
+        // Unreal path is NON_PIXEL_SHADER_RESOURCE (XeSSFeature_Dx12.cpp: ColorResourceBarrier
+        // is set to RENDER_TARGET for Unreal, and the barrier runs from there). A texture does
+        // not decay the way a buffer does, so that -- not the state handed over -- is what the
+        // next frame's barrier has to name as its StateBefore. Naming the handed-over state
+        // instead put a barrier with a wrong StateBefore in front of every copy after the
+        // first, and the opening frames came out black.
+        p->resultState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        p->recorded.fetch_add(1, std::memory_order_relaxed);
 
-    if (stage == DiagStage::Swap && haveBuffers && p->result != nullptr)
-    {
         // The reference hands the result of Record to the upscaler as its colour input, and
         // leaves the frame alone when it answers null. Same here.
         return p->result.Get();
     }
 
+    p->recorded.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
 }
 
