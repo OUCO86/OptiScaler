@@ -25,6 +25,7 @@
 #include <wrl/client.h>
 
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -87,12 +88,33 @@ struct Bridge
     // Taken by name, the way the reference takes it: the import is not in the loader's static
     // table on every driver that has it.
     PFN_vkImportSemaphoreWin32HandleKHR importSemaphore = nullptr;
+    PFN_vkGetMemoryWin32HandlePropertiesKHR memoryHandleProperties = nullptr;
 };
 
 inline Bridge& TheBridge()
 {
     static Bridge b;
     return b;
+}
+
+// Which memory type an imported D3D12 allocation may live in: the intersection of what the
+// buffer asked for and what the handle can be imported into, narrowed to device-local the way
+// the reference narrows it. The largest value when there is none, which is a refusal to
+// allocate rather than a guess at a type that fails further away from the reason.
+inline uint32_t MemoryType(uint32_t bits, VkMemoryPropertyFlags want)
+{
+    Bridge& b = TheBridge();
+
+    VkPhysicalDeviceMemoryProperties props {};
+    vkGetPhysicalDeviceMemoryProperties(b.physical, &props);
+
+    for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
+    {
+        if ((bits & (1u << i)) != 0 && (props.memoryTypes[i].propertyFlags & want) == want)
+            return i;
+    }
+
+    return std::numeric_limits<uint32_t>::max();
 }
 
 // A shared D3D12 fence as a timeline semaphore, in the reference's own two steps: ask whether
@@ -284,6 +306,14 @@ inline bool Create(ID3D12Device* d3d, std::string& why)
         return false;
     }
 
+    b.memoryHandleProperties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
+        vkGetDeviceProcAddr(b.device, "vkGetMemoryWin32HandlePropertiesKHR"));
+    if (b.memoryHandleProperties == nullptr)
+    {
+        why = "the device has no vkGetMemoryWin32HandlePropertiesKHR";
+        return false;
+    }
+
     VkCommandPoolCreateInfo poolInfo { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = b.queueFamily;
@@ -337,7 +367,10 @@ inline bool Create(ID3D12Device* d3d, std::string& why)
 // is recorded (nothing yet), signal the value the game's queue will wait for. Returns a VkResult
 // so the caller can decide whether the frame's Wait may be queued at all -- a Wait on a value
 // nothing is going to signal would stop the game's queue, not slow it.
-inline VkResult Submit(uint64_t value, std::string& why)
+// `copy` and its two buffers are the slot's work, when it has any: one buffer-to-buffer copy,
+// which is what the reference's own fallback records in the network's place (its Passthrough).
+// A null `copy` is the handshake on its own, as it has been until now.
+inline VkResult Submit(uint64_t value, const VkBufferCopy* copy, VkBuffer from, VkBuffer to, std::string& why)
 {
     Bridge& b = TheBridge();
     if (!b.ready)
@@ -399,8 +432,9 @@ inline VkResult Submit(uint64_t value, std::string& why)
         return r;
     }
 
-    // Nothing recorded: the handshake is the only thing being measured. The frame's images go
-    // here once they are imported, at the sizes the frame itself reports.
+    if (copy != nullptr)
+        vkCmdCopyBuffer(c, from, to, 1, copy);
+
     r = vkEndCommandBuffer(c);
     if (r != VK_SUCCESS)
     {

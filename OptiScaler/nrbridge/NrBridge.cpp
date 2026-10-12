@@ -32,6 +32,11 @@
 // keeps its pe bridge separate.
 #include "VulkanGap.h"
 
+// How the frame's pixels get across: a linear buffer, shared by handle, that both APIs copy a
+// texture's rows into and out of. The reference's shape, not a shared texture, and its sizes
+// are the frame's own.
+#include "SharedBuffer.h"
+
 // The shape of everything here comes from the reference integration; see NrBridge.h. What is
 // ours is only the part that has to be: reading this host's parameter block, and resolving the
 // state each resource is actually in before anything is recorded.
@@ -107,6 +112,75 @@ const char* FormatName(DXGI_FORMAT f)
     default:
         return "?";
     }
+}
+
+// One transition, all subresources, and nothing at all when the state asked for is the state
+// the resource is already in -- which is the usual case for the buffers, and the case that has
+// to cost no barrier.
+void Transition(ID3D12GraphicsCommandList* c, ID3D12Resource* r, D3D12_RESOURCE_STATES before,
+                D3D12_RESOURCE_STATES after)
+{
+    if (r == nullptr || before == after)
+        return;
+
+    D3D12_RESOURCE_BARRIER b {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = before;
+    b.Transition.StateAfter = after;
+    c->ResourceBarrier(1, &b);
+}
+
+// The reference's CopyToBuffer, and the way back out of the buffer into the texture the
+// upscaler will read. Both take the texture into the copy's own state and hand it back in the
+// state it was found in: that state belongs to the game, and the upscaler expects to find it.
+void CopyToBuffer(ID3D12GraphicsCommandList* c, ID3D12Resource* texture, D3D12_RESOURCE_STATES state,
+                  ID3D12Resource* buffer, const NrBridge::Footprint& fp, UINT w, UINT h)
+{
+    Transition(c, texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(c, buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    D3D12_TEXTURE_COPY_LOCATION dst { buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {} };
+    dst.PlacedFootprint = fp.d3d;
+    D3D12_TEXTURE_COPY_LOCATION src { texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {} };
+    const D3D12_BOX box { 0, 0, 0, w, h, 1 };
+    c->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+
+    Transition(c, buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    Transition(c, texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+}
+
+void CopyFromBuffer(ID3D12GraphicsCommandList* c, ID3D12Resource* texture, ID3D12Resource* buffer,
+                    const NrBridge::Footprint& fp, UINT w, UINT h, D3D12_RESOURCE_STATES state)
+{
+    Transition(c, buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(c, texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    D3D12_TEXTURE_COPY_LOCATION dst { texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {} };
+    D3D12_TEXTURE_COPY_LOCATION src { buffer, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {} };
+    src.PlacedFootprint = fp.d3d;
+    c->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    Transition(c, texture, D3D12_RESOURCE_STATE_COPY_DEST, state);
+    Transition(c, buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
+// The reference's ResultDesc: the upscaler's colour texture, copied, without its flags. Its
+// comment is why the flags are dropped -- Super Resolution reads this texture, it does not need
+// UAV access, and asking for a typed UAV on an RGB9E5 or sRGB input is a thing drivers refuse.
+D3D12_RESOURCE_DESC ResultDesc(const D3D12_RESOURCE_DESC& colour, UINT w, UINT h)
+{
+    D3D12_RESOURCE_DESC rd = colour;
+    rd.Width = w;
+    rd.Height = h;
+    rd.MipLevels = 1;
+    rd.DepthOrArraySize = 1;
+    rd.SampleDesc = { 1, 0 };
+    rd.Alignment = 0;
+    rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    return rd;
 }
 
 std::string Describe(const char* what, ID3D12Resource* r)
@@ -212,6 +286,10 @@ struct Gap
     std::atomic<unsigned long long> vkSubmits { 0 };
     std::atomic<unsigned long long> vkFailures { 0 };
     std::atomic<unsigned long long> waits { 0 };
+    // How many of the slot's submissions carried the frame's pixels, and how many carried the
+    // handshake alone. The two not adding up to the number of runs is the interesting case.
+    std::atomic<unsigned long long> copies { 0 };
+    std::atomic<unsigned long long> noWork { 0 };
     std::atomic<double> cpuTotalMs { 0.0 };
     std::atomic<double> cpuMaxMs { 0.0 };
 };
@@ -248,7 +326,7 @@ bool BuildGap(ID3D12Device* device)
 }
 
 // The reference's EnqueueHipFn, called by BetweenThunk between the two halves.
-int32_t EnqueueGap(void*, void* job, void* command_queue)
+int32_t EnqueueGap(void* session, void* job, void* command_queue)
 {
     if (job == nullptr || command_queue == nullptr)
         return -1;
@@ -292,8 +370,21 @@ int32_t EnqueueGap(void*, void* job, void* command_queue)
         return -1;
     }
 
+    // What the slot runs, when the frame has buffers: one copy, in the network's place, which
+    // is the reference's Passthrough. It is asked for before the submit because the answer
+    // decides whether the submit carries work at all -- no buffers, no copy, and the handshake
+    // on its own is still what gets measured.
+    VkBufferCopy copy {};
+    VkBuffer from = VK_NULL_HANDLE, to = VK_NULL_HANDLE;
+    auto* host = static_cast<NrBridge::Backend*>(session);
+    const bool work = host != nullptr && host->SlotCopy(&copy, &from, &to);
+    if (work)
+        g.copies.fetch_add(1, std::memory_order_relaxed);
+    else
+        g.noWork.fetch_add(1, std::memory_order_relaxed);
+
     std::string why;
-    const VkResult vr = VulkanGap::Submit(value, why);
+    const VkResult vr = VulkanGap::Submit(value, work ? &copy : nullptr, from, to, why);
     if (vr != VK_SUCCESS)
     {
         // Recorded, and left for the next frame: a Wait on a value nothing signalled would stop
@@ -480,7 +571,7 @@ void LogFrame(const NrBridge::Frame& f)
     // Vulkan makes of it. If seenToVk stays behind toVkDone, the import never shared the fence,
     // and the Vulkan side will wait for a value nothing is going to give it.
     LOG_INFO("NrBridge gap: between={} enqueue={} skipped={} | runs={} submits={} waits={} failures={} cpu={:.3f}ms "
-             "max={:.3f}ms{} | vk submits={} failures={}{} | toVkDone={} seenByVk={} | fromVkDone={} "
+             "max={:.3f}ms{} | vk submits={} failures={} copies={} nowork={}{} | toVkDone={} seenByVk={} | fromVkDone={} "
              "seenByVk={} gapSignalled={}",
              pending.betweenHits.load(std::memory_order_relaxed),
              pending.enqueueCalls.load(std::memory_order_relaxed),
@@ -490,6 +581,7 @@ void LogFrame(const NrBridge::Frame& f)
              gap.failures.load(std::memory_order_relaxed), gap.cpuTotalMs.load(std::memory_order_relaxed),
              gap.cpuMaxMs.load(std::memory_order_relaxed), gap.failure.empty() ? "" : gap.failure.c_str(),
              gap.vkSubmits.load(std::memory_order_relaxed), gap.vkFailures.load(std::memory_order_relaxed),
+             gap.copies.load(std::memory_order_relaxed), gap.noWork.load(std::memory_order_relaxed),
              vk.lost ? " (vk given up on after " + std::to_string(vk.timeouts) + " timeouts)" : "",
              toVkDone, vk.seenToVk, fromVkDone, vk.seenFromVk, signalled);
 }
@@ -544,7 +636,93 @@ struct Backend::Impl
     ID3D12CommandQueue* queue = nullptr;
     std::filesystem::path directory;
     std::atomic<unsigned long long> recorded { 0 };
+
+    // Everything sized by the frame: the two shared buffers the colour crosses in, and the
+    // texture the upscaler is handed back. Made again when the frame's extent or format
+    // changes, which with dynamic resolution it does, and never sized from anything but the
+    // frame that is being recorded.
+    UINT width = 0, height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    NrBridge::Footprint footprint;
+    NrBridge::SharedBuffer input, output;
+    Microsoft::WRL::ComPtr<ID3D12Resource> result;
+
+    // The set that was in use before the last change of geometry, kept because the GPU may
+    // still be reading it: what frees it is the next change, which is at least one frame
+    // later, and a frame's work has been waited on by then.
+    NrBridge::SharedBuffer oldInput, oldOutput;
+    Microsoft::WRL::ComPtr<ID3D12Resource> oldResult;
+
+    std::string bufferFailure;
+    bool BuildBuffers(ID3D12Resource* colour, UINT w, UINT h);
 };
+
+// The frame's buffers, made the first time and whenever the frame's geometry is not the one
+// they were made for. A failure is recorded and the frame is left alone, which is the same
+// answer the reference gives: pass the frame through rather than fail it.
+bool Backend::Impl::BuildBuffers(ID3D12Resource* colour, UINT w, UINT h)
+{
+    if (colour == nullptr || w == 0 || h == 0)
+    {
+        bufferFailure = "the frame has no extent";
+        return false;
+    }
+
+    const auto desc = colour->GetDesc();
+    if (input.buffer != VK_NULL_HANDLE && width == w && height == h && format == desc.Format)
+        return true;
+
+    oldInput.Release();
+    oldOutput.Release();
+    oldResult.Reset();
+
+    oldInput = input;
+    oldOutput = output;
+    oldResult = result;
+
+    input = {};
+    output = {};
+    result.Reset();
+
+    NrBridge::Footprint fp(desc.Format, w, h);
+    if (!fp.valid())
+    {
+        bufferFailure = "the colour format has no footprint";
+        return false;
+    }
+
+    std::string why;
+    if (!input.Create(device, fp.bytes, why))
+    {
+        bufferFailure = "input " + why;
+        return false;
+    }
+    if (!output.Create(device, fp.bytes, why))
+    {
+        bufferFailure = "output " + why;
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES hp {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    const D3D12_RESOURCE_DESC rd = ResultDesc(desc, w, h);
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                               IID_PPV_ARGS(&result))) ||
+        !result)
+    {
+        bufferFailure = "could not create the result texture";
+        result.Reset();
+        return false;
+    }
+
+    footprint = fp;
+    width = w;
+    height = h;
+    format = desc.Format;
+    bufferFailure.clear();
+    return true;
+}
 
 Backend::Backend(ID3D12Device* device, ID3D12CommandQueue* queue, const std::filesystem::path& directory)
     : p(new Impl { device, queue, directory })
@@ -556,8 +734,32 @@ Backend::Backend(ID3D12Device* device, ID3D12CommandQueue* queue, const std::fil
 // own signal for "skip", so the caller's behaviour is already correct either way.
 ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, const Settings&)
 {
-    if (f.motion == nullptr)
+    if (f.motion == nullptr || f.colour == nullptr)
         return nullptr;
+
+    // The frame's own extent: what the upscaler was told, and what the copy is described with.
+    // The parameter block is the authority, and the texture only a fallback for a frame that
+    // did not report one.
+    const auto desc = f.colour->GetDesc();
+    const UINT w = f.width != 0 ? f.width : static_cast<UINT>(desc.Width);
+    const UINT h = f.height != 0 ? f.height : static_cast<UINT>(desc.Height);
+
+    const bool haveBuffers = p->BuildBuffers(f.colour, w, h);
+    if (!haveBuffers)
+    {
+        // Said once: a frame without buffers is a frame passed through, which is not an error
+        // worth a line per frame, but the reason it has none is worth one line at all.
+        static std::atomic<bool> said { false };
+        if (!said.exchange(true, std::memory_order_relaxed))
+            LOG_WARN("NrBridge: the frame's buffers could not be made ({}): frames are passed through",
+                     p->bufferFailure);
+    }
+
+    // The reference's RecordInputs, in the reference's place: before the cut, so that it lands
+    // in the producer half and is complete before the slot's wait is satisfied. The frame's
+    // colour goes into the buffer the slot's copy reads from.
+    if (haveBuffers)
+        CopyToBuffer(cmd, f.colour, f.colourState, p->input.resource.Get(), p->footprint, w, h);
 
     // The cut goes here because that is where the reference puts it, in
     // ta_be_MochizukiBackend.cpp:
@@ -566,9 +768,7 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
     //         LmxxfCut::TrySplitAtEvaluate(cmd) != S_OK ||
     //         p->api.RecordOutputs(...) != LMXXF_NR_OK)
     //
-    // between recording the network's inputs and recording its outputs. There is no network
-    // attached yet, so the two calls around it do not exist and nothing is enqueued for the
-    // slot to run: what is left is the cut on its own, which is the only thing being measured.
+    // between recording the network's inputs and recording its outputs.
     const HRESULT hr = DlssNr::Backend::LmxxfCut::TrySplitAtEvaluate(cmd);
     g_lastCutHr.store(hr, std::memory_order_relaxed);
     if (hr == S_OK)
@@ -595,6 +795,17 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
     else
         g_splitFailed.fetch_add(1, std::memory_order_relaxed);
 
+    // The reference's RecordOutputs, in the reference's place: after the cut, so that it lands
+    // in the continuation half, which the game's queue does not reach until the slot's submit
+    // has signalled. What comes back out of the buffer is the slot's copy, which for now is
+    // the frame's own colour -- the reference's Passthrough, in the network's place.
+    if (haveBuffers && p->result != nullptr)
+    {
+        CopyFromBuffer(cmd, p->result.Get(), p->output.resource.Get(), p->footprint, w, h, f.colourState);
+        p->recorded.fetch_add(1, std::memory_order_relaxed);
+        return p->result.Get();
+    }
+
     p->recorded.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
 }
@@ -615,6 +826,23 @@ bool Backend::PollRelease() { return true; }
 bool Backend::CompletePendingReleaseLocked() { return true; }
 void Backend::ResetGraphicsWaitState() { }
 void Backend::InvalidateHistory() { }
+
+bool Backend::SlotCopy(VkBufferCopy* region, VkBuffer* from, VkBuffer* to)
+{
+    if (region == nullptr || from == nullptr || to == nullptr)
+        return false;
+
+    if (p->input.buffer == VK_NULL_HANDLE || p->output.buffer == VK_NULL_HANDLE || !p->footprint.valid())
+        return false;
+
+    // The whole footprint: the rows the frame's colour was copied into, and no more.
+    region->srcOffset = 0;
+    region->dstOffset = 0;
+    region->size = p->footprint.bytes;
+    *from = p->input.buffer;
+    *to = p->output.buffer;
+    return true;
+}
 std::string Backend::Status() const { return "no renderer attached"; }
 bool Backend::IsRunning() const { return false; }
 UINT64 Backend::RecordedFrames() const { return p->recorded.load(std::memory_order_relaxed); }

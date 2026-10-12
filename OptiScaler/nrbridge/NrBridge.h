@@ -20,6 +20,7 @@
 
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
+#include <vulkan/vulkan.h>
 
 #include <algorithm>
 #include <cmath>
@@ -129,6 +130,10 @@ class Backend
     bool CompletePendingReleaseLocked();
     void ResetGraphicsWaitState();
     void InvalidateHistory(); // applied at the next safe recording boundary
+    // What the slot is to run for the frame it stands in: one copy from the buffer the frame's
+    // colour was put into, to the buffer the answer comes back in. False while there are no
+    // buffers, which is also how the slot knows to submit its handshake alone.
+    bool SlotCopy(VkBufferCopy* region, VkBuffer* from, VkBuffer* to);
     std::string Status() const;
     bool IsRunning() const;
     UINT64 RecordedFrames() const;
