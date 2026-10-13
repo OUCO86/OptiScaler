@@ -173,6 +173,15 @@ class Pipeline
     // in and nothing is read back, so there is no stage to time but the graph's.
     bool RunFused(unsigned long long fence, unsigned long long value, std::string& why);
 
+    /* The reference's "the history restarts on the next frame", reached from outside.
+     *
+     * MochizukiNrRuntime.cpp:2134-2136 sets `resetPending` when a frame arrives on a queue
+     * other than the last frame's, because that frame's colour was copied before the switch
+     * was known and so may race the last frame's network. ResetHistory itself stays private
+     * because nothing else has a reason to call it; this is the host's way of saying the same
+     * thing from the gap, and it seeds `previous_` from the frame that is asking. */
+    void RestartHistory(const float* colour) { ResetHistory(colour); }
+
     // What the frame cost, split the way the daemon's own stage log splits it.
     double FeaturesMs() const { return featuresMs_; }
     double NetMs() const { return netMs_; }

@@ -227,6 +227,15 @@ std::string g_failureReason;
 std::atomic<unsigned long long> g_splitOk { 0 };
 std::atomic<unsigned long long> g_splitNoProxy { 0 };
 std::atomic<unsigned long long> g_splitFailed { 0 };
+// `g_splitNoProxy` is one counter over four different reasons, and which one dominates decides
+// where the work is: if it is mostly the list being the game's own, the hook's timing is the
+// problem; if it is the proxy refusing its own list, no amount of earlier hooking helps and the
+// cut has to become possible instead. Counting them apart is the difference between those two
+// searches, and it costs four atomic increments on a path that already does a COM query.
+std::atomic<unsigned long long> g_declNotOurs { 0 };
+std::atomic<unsigned long long> g_declIneligible { 0 };
+std::atomic<unsigned long long> g_declNoResources { 0 };
+std::atomic<unsigned long long> g_declNoCompute { 0 };
 // The HRESULT of the last cut, kept only so it can be printed the way the reference prints it:
 // its own boundary line carries cutHr={:X}, because a cut that stopped working shows up there
 // before it shows up anywhere else.
@@ -340,6 +349,78 @@ struct Gap
     std::atomic<double> stepFenceMs { 0.0 };
     std::atomic<double> stepWorkMs { 0.0 };
     std::atomic<double> stepWriteMs { 0.0 };
+
+    /* The reference's Follow(), and the whole reason this block exists.
+     *
+     * MochizukiNrRuntime.cpp:7-8 declares the capability:
+     *
+     *   "Any game queue may run the list (MOCHIZUKI_NR_FEATURE_ANY_QUEUE): a frame from
+     *    another queue than the last one waits for the last one first."
+     *
+     * and its Follow() (ta_MochizukiNrRuntime.cpp:2137) is what pays for it:
+     *
+     *   "A frame from another queue than the last frame's (by COM identity) first waits there
+     *    for the last frame's finished value, so its signal cannot land before the last
+     *    producer's (toVk would go backwards and meet a Vulkan wait early) and the Vulkan
+     *    side takes the frames in order."
+     *
+     * We signal `value = nextValue++` on whichever queue the frame is on, and two D3D12
+     * queues are independent: queue A's value 100 and queue B's value 101 can reach the GPU
+     * in either order. If 101 lands first, Vulkan has already moved past 100 when 100
+     * arrives -- toVk goes backwards -- and the network's answer belongs to a frame that is
+     * not the one the slot copied. That is a wrong frame rather than a slow one, and it is
+     * what a persistent flicker on a still scene is made of: standing still does not stop
+     * the engine from handing successive frames to different queues.
+     *
+     * Nothing here is a theory of our own: the ordering requirement is the reference's, the
+     * reason is the reference's, and the same hazard is the one this project already hit as
+     * "cross-process semaphores do not order" and misattributed (see the project's memory:
+     * the observation was right, the attribution was not). Two fences and a counter cannot
+     * order two queues; only one of them waiting on the other can.
+     *
+     * ---------------------------------------------------------------------------
+     * 2026-10-13 · 六块全部停用，但代码保留。
+     *
+     * 实测结论（本机、匹诺曹、2026-10-13 23:47-23:48 一次连续运行，日志有据）：
+     *     NrBridge producer: queue=0x2d9454473b0 lastValue=505 | queue switches=0 of 505 runs (0.0%)
+     * 505 次插槽运行，队列切换 **0** 次。《匹诺曹》全程单队列，ANY_QUEUE 这条路一次都不走。
+     *
+     * 停用理由不是它写错了 —— 逻辑逐条对着 ta_MochizukiNrRuntime.cpp:2137 的 Follow()
+     * 写的，注释里的每一条理由都是引用。停用是因为**对这个游戏无效**，留着只会在每一帧
+     * 白做一次 AddRef/Release（实测 runs 与 queue 完全相同即为空转）。
+     *
+     * 为什么留着不删：The 是靠这个能力位（MOCHIZUKI_NR_FEATURE_ANY_QUEUE，
+     * ta_MochizukiNrRuntime.cpp:4512）支撑"任何队列都能跑"的，别的引擎（多队列提交
+     * 更积极的、DX12 走的 UE4、多线程录制更狠的）**可能真的会换队列**。本游戏用不上
+     * 不代表别的游戏用不上。等哪天在别的游戏上看到 `queueSwitches` 不为零，
+     * 把 `#if 0` 去掉就能直接用，不必重写。
+     *
+     * 复用前必看两处曾经的坑：
+     *   1. `ProducerId::Of` 必须 **AddRef**，不能 `ComPtr::Attach`。传进来的 queue 是
+     *      BetweenThunk 借的裸指针，没人给它加过引用；Attach 会白拿一个不属于我们的引用，
+     *      析构多 Release 一次，引用计数被多减 → 队列提前释放 → 实测崩在 cut #10。
+     *   2. `resetPending` 必须在 `EnqueueGap` 里 Signal 之前判断，且消费点要在帧录制处
+     *      （fused 走 freshHistory，非 fused 走 RestartHistory），不能省。
+     * --------------------------------------------------------------------------- */
+#if 0
+    std::mutex producerMutex;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> lastProducer;
+    IUnknown* lastProducerId = nullptr;
+    // The last value this gap signalled and the value Vulkan finished, i.e. the two numbers
+    // Follow() needs: what a new queue must wait for, and how far the old one got.
+    std::atomic<UINT64> lastProduced { 0 };
+    std::atomic<UINT64> lastFinished { 0 };
+    // Set when a frame arrived on a different queue than the last one. The history is
+    // restarted from it, because the reference says so in the same breath: "The new queue's
+    // first half has already copied its colour, which may race the last frame's network:
+    // both frames may look wrong, and the history restarts on the next frame."
+    std::atomic<bool> resetPending { false };
+    // The reference counts these and logs the first few, then one in a thousand, because
+    // "a game may switch every frame" (its own comment). The count is also the measurement:
+    // if it tracks the dropped-NR frames, this is the cause; if it stays near zero, it is not.
+    std::atomic<unsigned long long> queueSwitches { 0 };
+    std::atomic<unsigned long long> producerWaitFailures { 0 };
+#endif
 };
 
 Gap& TheGap()
@@ -349,6 +430,139 @@ Gap& TheGap()
     static Gap g;
     return g;
 }
+
+// The reference's Producer::Of: a game queue and its COM identity, both kept, so that the
+// comparison is against the object rather than against the address (a queue that has been
+// destroyed and a new one made at the same address is a different queue).
+//
+// 🔒 2026-10-13 停用（实测 queue switches=0 of 505，本游戏单队列）。代码保留备用。
+//    复用时注意下面 Of() 里 AddRef 那个坑。详见 Gap 结构体上方的说明块。
+#if 0
+struct ProducerId
+{
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    IUnknown* id = nullptr;
+
+    static ProducerId Of(ID3D12CommandQueue* q)
+    {
+        ProducerId p;
+        if (q == nullptr)
+            return p;
+        /* AddRef, not Attach. The reference writes `q->AddRef()` here
+         * (ta_MochizukiNrRuntime.cpp:1034) and the word is the whole of it: the pointer
+         * handed to EnqueueGap is the game's, borrowed by BetweenThunk, and nobody has taken a
+         * reference on it. Attach would take ownership of a reference that was never ours,
+         * and the ComPtr's Release would then be one Release too many -- the queue's count
+         * falls below the number of owners and the next thing that touches it is a dead
+         * object. That is what ended the run at cut #10. */
+        q->AddRef();
+        p.queue.Attach(q);
+        q->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(&p.id));
+        return p;
+    }
+
+    ~ProducerId()
+    {
+        if (id != nullptr)
+            id->Release();
+    }
+
+    ProducerId() = default;
+    // Moved, not copied: the identity is a reference, and two owners would release it twice.
+    ProducerId(ProducerId&& other) noexcept
+        : queue(std::move(other.queue)), id(std::exchange(other.id, nullptr))
+    {
+    }
+    ProducerId& operator=(ProducerId&& other) noexcept
+    {
+        if (this != &other)
+        {
+            queue = std::move(other.queue);
+            id = std::exchange(other.id, nullptr);
+        }
+        return *this;
+    }
+    ProducerId(const ProducerId&) = delete;
+    ProducerId& operator=(const ProducerId&) = delete;
+};
+#endif
+
+// The reference's Follow(), called once per slot run, before the producer's Signal.
+//
+// The order inside is the reference's, and every step of it has a reason stated there:
+//
+//   1. the same queue as last time: nothing to do;
+//   2. a different queue: wait on it for the last frame's finished value, so this frame's
+//      Signal cannot land before the last one's (toVk would go backwards);
+//   3. a Signal nothing will finish (the frame failed after it) has no finished value to wait
+//      for, so the new queue waits for it in toVk instead -- the reference handles this case
+//      too, and it is the one that bites while frames are being dropped;
+//   4. the queue is remembered for the next frame.
+//
+// Step 2 is the one whose absence let toVk go backwards. It is a queue waiting on a fence,
+// which is the only thing that orders two independent D3D12 queues; two fences and a counter
+// cannot.
+//
+// 🔒 2026-10-13 停用。逻辑本身是对的（逐条对着 ta_MochizukiNrRuntime.cpp:2137），
+//    但实测本游戏 queue switches=0 of 505，一次都不触发，纯属每帧空转。
+//    代码保留，换个会换队列的游戏去掉 #if 0 即可。详见 Gap 结构体上方说明块。
+#if 0
+HRESULT Follow(ID3D12CommandQueue* producer)
+{
+    Gap& g = TheGap();
+    auto& vk = VulkanGap::TheBridge();
+    std::lock_guard<std::mutex> lock(g.producerMutex);
+
+    ProducerId p = ProducerId::Of(producer);
+    if (p.id == nullptr)
+        return E_INVALIDARG;
+
+    // (1) The reference returns S_OK here, on the identity, having done nothing. Taken before
+    // any of the bookkeeping below, so the common frame -- the same queue as the last, which
+    // is every frame when the engine does not rotate -- costs one identity compare and one
+    // pair of AddRef/Release, and touches no fence at all.
+    if (g.lastProducerId != nullptr && p.id == g.lastProducerId)
+        return S_OK;
+
+    const UINT64 last = g.lastFinished.load(std::memory_order_relaxed);
+    const UINT64 produced = g.lastProduced.load(std::memory_order_relaxed);
+    // (3) `stray` is the reference's own name for a signalled value nothing finished: the
+    // frame failed after its Signal and never reached Vulkan.
+    const UINT64 signalled = g.signalled.load(std::memory_order_relaxed);
+    const UINT64 stray = signalled > produced ? signalled : 0;
+
+    if (last != 0 || stray != 0)
+    {
+        // (2) The wait that makes one queue's work ordered against the other's.
+        HRESULT hr = last != 0 ? producer->Wait(vk.fromVk.Get(), last) : S_OK;
+        if (SUCCEEDED(hr) && stray != 0)
+            hr = producer->Wait(vk.toVk.Get(), stray);
+        if (FAILED(hr))
+        {
+            g.producerWaitFailures.fetch_add(1, std::memory_order_relaxed);
+            return hr;
+        }
+
+        // The reference, in the same breath as the wait: "both frames may look wrong, and
+        // the history restarts on the next frame". Dropped where the frame is recorded.
+        g.resetPending.store(true, std::memory_order_relaxed);
+
+        const unsigned long long n = g.queueSwitches.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 12 || n % 1000 == 0)
+            LOG_INFO("NrBridge gap: a frame from queue {} after one from queue {} (switch {} of the gap): "
+                     "it waits there for the last frame; this frame may look wrong, and the history restarts",
+                     static_cast<void*>(producer), static_cast<void*>(g.lastProducer.Get()), n);
+    }
+
+    // (4) The reference replaces lastProducer under the same mutex.
+    if (g.lastProducerId != nullptr)
+        g.lastProducerId->Release();
+    g.lastProducerId = p.id;
+    p.id = nullptr;          // ownership moved to the gap
+    g.lastProducer = p.queue;
+    return S_OK;
+}
+#endif
 
 // `on`, where it is not null, is the device the network runs on: the hand-over is
 // then built on it rather than beside it, which is the shape the reference has (one
@@ -451,12 +665,32 @@ int32_t EnqueueGap(void* session, void* job, void* command_queue)
     // is what the game's queue is later made to wait on. The hand-over fence is the one the
     // bridge imported, so the value enqueued here is the value the Vulkan queue waits for --
     // the frame's producer half completes before any of this runs.
+    // The reference's Follow(), before anything is signalled: a frame from a queue other than
+    // the last frame's waits there for the last frame, so its Signal cannot land first. See
+    // the block comment on Gap's producer fields for why this is not optional.
+#if 0
+    // 🔒 2026-10-13 停用：实测本游戏 queue switches=0 of 505（单队列），本调用恒为空转。
+    //    需要时连同 Follow()、Gap 的 producer 字段一起取消注释，三处缺一不可。
+    if (FAILED(Follow(queue)))
+    {
+        g.producerWaitFailures.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+#endif
+
     const UINT64 value = g.nextValue++;
     auto& vk = VulkanGap::TheBridge();
     const auto tSignal = Clock::now();
     const HRESULT hr = queue->Signal(vk.toVk.Get(), value);
     const auto tRead = Clock::now();
     g.signalled.store(value, std::memory_order_relaxed);
+#if 0
+    // The reference records the produced value under the same mutex as Follow's, which is
+    // what makes the two agree on which value is the last one. Ours is a single writer on
+    // the render thread, which is the same guarantee said shorter.
+    // 🔒 2026-10-13 停用，随 Follow() 一起（Gap 的 lastProduced 已注释）。
+    g.lastProduced.store(value, std::memory_order_relaxed);
+#endif
 
     if (FAILED(hr))
     {
@@ -605,6 +839,16 @@ int32_t EnqueueGap(void* session, void* job, void* command_queue)
     }
 
     g.waits.fetch_add(1, std::memory_order_relaxed);
+
+    // The reference's Submitted(): the frame is on the Vulkan queue, so fromVk will reach
+    // this value whether or not the wait above went through, and a later frame on another
+    // queue is owed a wait for exactly this number. Recorded only here -- after the submit
+    // and the wait are both queued -- because a value recorded before them is a value
+    // nothing has promised yet, and Follow() would wait on a promise that never came.
+#if 0
+    // 🔒 2026-10-13 停用，随 Follow() 一起（Gap 的 lastFinished 已注释）。
+    g.lastFinished.store(value, std::memory_order_release);
+#endif
 
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     g.cpuTotalMs.store(g.cpuTotalMs.load(std::memory_order_relaxed) + ms, std::memory_order_relaxed);
@@ -767,6 +1011,19 @@ void LogFrame(const NrBridge::Frame& f)
              DlssNr::Submission::g_continuationSubmissions.load(std::memory_order_relaxed),
              DlssNr::Submission::g_submissionFailures.load(std::memory_order_relaxed));
 
+    /* The same decline, counted four ways. `declined` above is their sum, and which of them it is
+     * decides what is worth doing: `notOurs` is the game's own list and only an earlier hook
+     * reaches it; the other three are the proxy refusing a list it *did* wrap, which no amount of
+     * hooking can fix and which needs the cut to become possible instead. Four numbers, one line,
+     * so that the next run names the reason instead of leaving it to be guessed at. */
+    LOG_INFO("NrBridge declines: notOurs={} ineligible={} noResources={} noCompute={} | "
+             "notOurs is the game's own list (hook timing); the other three are the proxy "
+             "refusing its own list (the cut has to become possible)",
+             g_declNotOurs.load(std::memory_order_relaxed),
+             g_declIneligible.load(std::memory_order_relaxed),
+             g_declNoResources.load(std::memory_order_relaxed),
+             g_declNoCompute.load(std::memory_order_relaxed));
+
     // Whether the slot runs at all. Its own counts come from the reference's Pending(), which
     // BetweenThunk fills in: betweenHits for a run whose list matched, enqueueCalls for the
     // call into the function, skippedHits for a run that found nothing to do.
@@ -800,6 +1057,25 @@ void LogFrame(const NrBridge::Frame& f)
              gap.copies.load(std::memory_order_relaxed), gap.noWork.load(std::memory_order_relaxed),
              vk.lost ? " (vk given up on after " + std::to_string(vk.timeouts) + " timeouts)" : "",
              toVkDone, vk.seenToVk, fromVkDone, vk.seenFromVk, signalled);
+
+    #if 0
+    /* The producer's queue, and how often it changes. This is the measurement the whole
+     * Follow() mechanism exists for, so it is read as a rate against the same window as the
+     * rest of the line rather than as a bare total: `switches` against `runs` says whether
+     * this game hands successive frames to different queues often enough to matter, and a
+     * number that stays at zero says the mechanism is armed and idle, which is a different
+     * answer from one that climbs.
+     *
+     * 🔒 2026-10-13 停用：测量已做完，结论是「本游戏单队列，switches=0 of 505」，
+     *    所以 Follow() 一并停用（见 Gap 结构体上方说明块）。留着这行是为了
+     *    将来在别的游戏上恢复该机制时，判据不用重写。 */
+    const auto runs = gap.runs.load(std::memory_order_relaxed);
+    const auto switches = gap.queueSwitches.load(std::memory_order_relaxed);
+    LOG_INFO("NrBridge producer: queue={} lastValue={} | queue switches={} of {} runs ({:.1f}%) waitFailures={}",
+             static_cast<void*>(gap.lastProducer.Get()), gap.lastProduced.load(std::memory_order_relaxed), switches,
+             runs, runs != 0 ? (100.0 * double(switches) / double(runs)) : 0.0,
+             gap.producerWaitFailures.load(std::memory_order_relaxed));
+#endif
 
     // What the pass itself did, on the frame it last ran. Printed beside the slot's own
     // counts because the two answer different questions: the slot's say whether the gap
@@ -1258,6 +1534,22 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
 
         if (!haveLogical || ineligible || !haveResources || !canCompute)
         {
+            // Counted by reason. The four are independent questions and they want different fixes:
+            // `!haveLogical` is the game's own list and only an earlier hook reaches it;
+            // `ineligible` is the proxy's own verdict on a list it did wrap; `!haveResources`
+            // is the proxy's bookkeeping being absent; `!canCompute` is `CanAppendCompute()`
+            // saying no, which on this host is `rawInterfaceEscaped` -- the proxy leaked a
+            // native interface at some point and says no for the rest of its life
+            // (`CommandListProxy.h`: "Lifetime-wide; an alias can outlive Reset").
+            if (!haveLogical)
+                g_declNotOurs.fetch_add(1, std::memory_order_relaxed);
+            else if (ineligible)
+                g_declIneligible.fetch_add(1, std::memory_order_relaxed);
+            else if (!haveResources)
+                g_declNoResources.fetch_add(1, std::memory_order_relaxed);
+            else
+                g_declNoCompute.fetch_add(1, std::memory_order_relaxed);
+
             const auto no = g_splitNoProxy.fetch_add(1, std::memory_order_relaxed) + 1;
             if (no <= 12)
                 LOG_INFO("NrBridge: frame not cuttable: {} -- the original frame is shown, "
@@ -1562,6 +1854,31 @@ bool Backend::SlotWork(UINT64 value)
     // what `value` is for — the same value the game's queue was asked to signal.
     if (p->network.Fused())
     {
+        /* The reference's resetPending, consumed. MochiNrRuntime.cpp:2134-2136, on the frame
+         * that arrived on a different queue than the last one:
+         *
+         *   "The new queue's first half has already copied its colour, which may race the
+         *    last frame's network: both frames may look wrong, and the history restarts on
+         *    the next frame."
+         *
+         * So the history is dropped at the next frame, not at the switch: the switch frame is
+         * already in flight by the time it is known. `freshHistory` is this layer's own name
+         * for that state and the graph already reads it, so consuming the flag here is the
+         * whole of it -- there is no second mechanism to add. */
+#if 0
+        // 🔒 2026-10-13 停用：resetPending 恒为 false（本游戏不换队列），这段是死代码。
+        //    复用时要与 Follow()、Gap 的 producer 字段、下面非 fused 的那一处一起打开。
+        if (TheGap().resetPending.exchange(false, std::memory_order_relaxed))
+        {
+            p->freshHistory = true;
+            static std::atomic<unsigned long long> saidResets { 0 };
+            const auto n = saidResets.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 12)
+                LOG_INFO("NrBridge: the history restarts ({}), as the reference does when the frame's queue changed",
+                         n);
+        }
+#endif
+
         // The frame's own pre-exposure, before the graph is run. It is the frame's and
         // not the open's: this game moves it between a quarter and all of it, and a
         // divisor baked in when the network was opened over- or under-exposes every
@@ -1637,6 +1954,15 @@ bool Backend::SlotWork(UINT64 value)
     }
 
     const auto tNet = std::chrono::steady_clock::now();
+
+    // The same resetPending the fused path consumes, on the path that has a history buffer
+    // rather than a flag. ResetHistory seeds `previous_` from this frame's own colour and
+    // clears haveHistory_, which is exactly "the history restarts".
+#if 0
+    // 🔒 2026-10-13 停用：同 fused 路径那一处，随 Follow() 一起。
+    if (TheGap().resetPending.exchange(false, std::memory_order_relaxed))
+        p->network.RestartHistory(p->hostColour.data());
+#endif
 
     std::string why;
     if (!p->network.Run(p->hostColour.data(), motion != nullptr ? motion->data() : nullptr, p->hostResult.data(),
