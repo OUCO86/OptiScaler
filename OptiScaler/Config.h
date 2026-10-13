@@ -376,6 +376,17 @@ class Config
     // it detours CreateCommandList for every list the game makes, so it is switched on only to
     // ask whether the cut is possible, and switching it off leaves the game exactly as it was.
     CustomOptional<bool> NrWrapLists { false };
+    // Run the network in the slot rather than the reference's passthrough. Off leaves the
+    // slot doing what it has always done -- the frame's own colour, copied -- which is the
+    // one change that separates a crash in the network from a crash in the hand-over.
+    CustomOptional<bool> NrNetwork { true };
+    // Move the history by the frame's motion vectors before the network sees it. Off is the
+    // identity reprojection the layer has always used: right where the scene stood still,
+    // wrong where it moved, and the thing this host exists to replace.
+    CustomOptional<bool> NrMvReproject { true };
+    // Where the network's pieces are: libxmx, the resident shaders, and the plan's own blob
+    // file. Empty takes the tree the plan was recorded into.
+    CustomOptional<std::string> NrFolder { "" };
     CustomOptional<bool> RestoreComputeSignature { false };
     CustomOptional<bool> RestoreGraphicSignature { false };
     CustomOptional<bool> ExtendedStateRestore { false };

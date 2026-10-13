@@ -733,6 +733,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="inputs\NVNGX_DLSS_Dx11.cpp" />
     <ClCompile Include="inputs\NVNGX_DLSS_Dx12.cpp" />
     <ClCompile Include="nrbridge\NrBridge.cpp" />
+    <ClCompile Include="nrbridge\NrPipeline.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="inputs\NVNGX_DLSS_Vk.cpp" />
     <ClCompile Include="upscalers\xess\XeSSFeature.cpp" />

@@ -40,6 +40,7 @@ constexpr uint64_t kSlotWaitNs = 250ull * 1000ull * 1000ull;
 struct Bridge
 {
     bool ready = false;
+    bool borrowed = false;   // the device is the network's: never destroy it here
     bool lost = false;
     std::string failure;
 
@@ -48,6 +49,10 @@ struct Bridge
     // Ours does the same, for the same reason and for a second one: a wait of a quarter second
     // in the between slot is a quarter second taken out of every frame after it.
     uint32_t timeouts = 0;
+
+    // The fence of the submission handed out last, so that a caller which needs the bytes it
+    // carried can wait for it without knowing which of the three slots it went into.
+    VkFence lastFence = VK_NULL_HANDLE;
 
     // What Vulkan reads out of the shared fences, kept beside what D3D12 reads out of them. If
     // the two ever disagree, the import did not share the fence at all, and that is a different
@@ -83,6 +88,10 @@ struct Bridge
     Microsoft::WRL::ComPtr<ID3D12Fence> toVk;
     Microsoft::WRL::ComPtr<ID3D12Fence> fromVk;
     VkSemaphore toVkSem = VK_NULL_HANDLE;
+    // The game's fence, as the handle it was shared by, kept because the network needs to
+    // wait on it too: it is the same fence, imported a second time on the device the graph
+    // runs on, and a handle is what an import is made of. Closed when the bridge goes.
+    HANDLE toVkShared = nullptr;
     VkSemaphore fromVkSem = VK_NULL_HANDLE;
 
     // Taken by name, the way the reference takes it: the import is not in the loader's static
@@ -96,6 +105,27 @@ inline Bridge& TheBridge()
     static Bridge b;
     return b;
 }
+
+// A buffer the host can read and write, on the bridge's own device.
+//
+// The frame's pixels cannot be read out of the hand-over's shared buffers directly: those
+// are device-local, which is what the import of a D3D12 allocation asks for, and nothing
+// promises a host pointer to one. So a frame that is to be worked on by the host crosses
+// twice -- shared buffer to staging, and staging back to shared -- and the two copies are
+// the only thing the device is asked to do for it.
+//
+// Declared here and defined below `MemoryType`, which it needs.
+struct Staging
+{
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    uint64_t size = 0;
+
+    bool Create(uint64_t bytes, std::string& why);
+    void Release();
+};
+
 
 // Which memory type an imported D3D12 allocation may live in: the intersection of what the
 // buffer asked for and what the handle can be imported into, narrowed to device-local the way
@@ -115,6 +145,103 @@ inline uint32_t MemoryType(uint32_t bits, VkMemoryPropertyFlags want)
     }
 
     return std::numeric_limits<uint32_t>::max();
+}
+
+// The staging buffer's two methods, out of line because `Create` wants `MemoryType`.
+inline bool Staging::Create(uint64_t bytes, std::string& why)
+{
+    Release();
+
+    Bridge& b = TheBridge();
+    if (!b.ready)
+    {
+        why = "the bridge is not up";
+        return false;
+    }
+
+    if (bytes == 0)
+    {
+        why = "a staging buffer of no bytes";
+        return false;
+    }
+
+    VkBufferCreateInfo bi { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bi.size = bytes;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    VkBuffer made = VK_NULL_HANDLE;
+    if (vkCreateBuffer(b.device, &bi, nullptr, &made) != VK_SUCCESS)
+    {
+        why = "vkCreateBuffer (staging) failed";
+        return false;
+    }
+
+    VkMemoryRequirements req {};
+    vkGetBufferMemoryRequirements(b.device, made, &req);
+
+    // Host visible and coherent, and deliberately not device local: this is the one
+    // allocation in the slot the host reads, and a coherent mapping means there is no
+    // invalidate or flush around it to get wrong.
+    const uint32_t type =
+        MemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (type == std::numeric_limits<uint32_t>::max())
+    {
+        vkDestroyBuffer(b.device, made, nullptr);
+        why = "no host-visible memory type for the staging buffer";
+        return false;
+    }
+
+    VkMemoryAllocateInfo ai { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = type;
+
+    VkDeviceMemory memoryMade = VK_NULL_HANDLE;
+    if (vkAllocateMemory(b.device, &ai, nullptr, &memoryMade) != VK_SUCCESS)
+    {
+        vkDestroyBuffer(b.device, made, nullptr);
+        why = "vkAllocateMemory (staging) failed";
+        return false;
+    }
+
+    if (vkBindBufferMemory(b.device, made, memoryMade, 0) != VK_SUCCESS)
+    {
+        vkFreeMemory(b.device, memoryMade, nullptr);
+        vkDestroyBuffer(b.device, made, nullptr);
+        why = "vkBindBufferMemory (staging) failed";
+        return false;
+    }
+
+    void* map = nullptr;
+    if (vkMapMemory(b.device, memoryMade, 0, req.size, 0, &map) != VK_SUCCESS)
+    {
+        vkFreeMemory(b.device, memoryMade, nullptr);
+        vkDestroyBuffer(b.device, made, nullptr);
+        why = "vkMapMemory (staging) failed";
+        return false;
+    }
+
+    buffer = made;
+    memory = memoryMade;
+    mapped = map;
+    size = bytes;
+    return true;
+}
+
+inline void Staging::Release()
+{
+    Bridge& b = TheBridge();
+    if (b.device == VK_NULL_HANDLE)
+        return;
+
+    if (memory != VK_NULL_HANDLE)
+    {
+        vkUnmapMemory(b.device, memory);
+        vkFreeMemory(b.device, memory, nullptr);
+    }
+    if (buffer != VK_NULL_HANDLE)
+        vkDestroyBuffer(b.device, buffer, nullptr);
+
+    *this = {};
 }
 
 // A shared D3D12 fence as a timeline semaphore, in the reference's own two steps: ask whether
@@ -167,7 +294,10 @@ inline VkSemaphore ImportFence(HANDLE handle, std::string& why)
     return semaphore;
 }
 
-inline VkSemaphore ShareAndImportFence(ID3D12Device* d3d, ID3D12Fence** out, std::string& why)
+// `shared`, where it is not null, takes the handle and the caller owns it. It is kept for
+// the one fence the graph has to wait on; every other one is closed here, as before.
+inline VkSemaphore ShareAndImportFence(ID3D12Device* d3d, ID3D12Fence** out, HANDLE* shared,
+                                      std::string& why)
 {
     Microsoft::WRL::ComPtr<ID3D12Fence> fence;
     if (FAILED(d3d->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence))) || !fence)
@@ -184,13 +314,128 @@ inline VkSemaphore ShareAndImportFence(ID3D12Device* d3d, ID3D12Fence** out, std
     }
 
     const VkSemaphore semaphore = ImportFence(handle, why);
-    CloseHandle(handle);
+    if (shared != nullptr && semaphore != VK_NULL_HANDLE)
+        *shared = handle;
+    else
+        CloseHandle(handle);
 
     if (semaphore == VK_NULL_HANDLE)
         return VK_NULL_HANDLE;
 
     *out = fence.Detach();
     return semaphore;
+}
+
+// A device that already exists, to build the hand-over on.
+//
+// The reference keeps one Vulkan device and one queue for both halves of the bridge
+// -- the hand-over and the network -- and says so where it hands them over
+// (`nr_pe_session.cpp`, `access.queue = bdev->queue()`; `ta_MochizukiNrRuntime.cpp`,
+// "The network runs on a Vulkan device of its own ... a Vulkan submit waits on it,
+// runs the network and writes the result into a third shared buffer"). Two devices of
+// our own, each importing the same shared resource and each with a queue of its own,
+// have no queue in common to be ordered on, and the memory between them is not
+// visible: the side that imported second reads something stable and wrong.
+struct Borrowed
+{
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t family = 0;
+};
+
+// Everything after the device exists, whichever way it came to be: the entry points
+// the shared handles need, the pool and buffers the slot submits with, and the two
+// fences the game's queue is ordered against.
+inline bool Finish(ID3D12Device* d3d, std::string& why)
+{
+    Bridge& b = TheBridge();
+    b.importSemaphore = reinterpret_cast<PFN_vkImportSemaphoreWin32HandleKHR>(
+        vkGetDeviceProcAddr(b.device, "vkImportSemaphoreWin32HandleKHR"));
+    if (b.importSemaphore == nullptr)
+    {
+        why = "the device has no vkImportSemaphoreWin32HandleKHR";
+        return false;
+    }
+
+    b.memoryHandleProperties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
+        vkGetDeviceProcAddr(b.device, "vkGetMemoryWin32HandlePropertiesKHR"));
+    if (b.memoryHandleProperties == nullptr)
+    {
+        why = "the device has no vkGetMemoryWin32HandlePropertiesKHR";
+        return false;
+    }
+
+    VkCommandPoolCreateInfo poolInfo { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = b.queueFamily;
+
+    if (vkCreateCommandPool(b.device, &poolInfo, nullptr, &b.pool) != VK_SUCCESS)
+    {
+        why = "vkCreateCommandPool failed";
+        return false;
+    }
+
+    VkCommandBufferAllocateInfo alloc { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    alloc.commandPool = b.pool;
+    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc.commandBufferCount = 3;
+
+    if (vkAllocateCommandBuffers(b.device, &alloc, b.cmd) != VK_SUCCESS)
+    {
+        why = "vkAllocateCommandBuffers failed";
+        return false;
+    }
+
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        VkFenceCreateInfo fenceInfo { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // the first use of a slot has nothing to wait for
+        if (vkCreateFence(b.device, &fenceInfo, nullptr, &b.done[i]) != VK_SUCCESS)
+        {
+            why = "vkCreateFence failed";
+            return false;
+        }
+    }
+
+    ID3D12Fence* to = nullptr;
+    ID3D12Fence* from = nullptr;
+    b.toVkSem = ShareAndImportFence(d3d, &to, &b.toVkShared, why);
+    if (b.toVkSem == VK_NULL_HANDLE)
+        return false;
+    b.toVk = to;
+
+    why.clear();
+    b.fromVkSem = ShareAndImportFence(d3d, &from, nullptr, why);
+    if (b.fromVkSem == VK_NULL_HANDLE)
+        return false;
+    b.fromVk = from;
+
+    b.ready = true;
+    return true;
+}
+
+// The hand-over on a device somebody else owns. Nothing here destroys that device,
+// and nothing here may: it is the network's, and the network outlives the frame.
+inline bool CreateOn(ID3D12Device* d3d, const Borrowed& on, std::string& why)
+{
+    Bridge& b = TheBridge();
+    if (b.ready)
+        return true;
+    if (on.device == VK_NULL_HANDLE || on.queue == VK_NULL_HANDLE)
+    {
+        why = "the network's device was not given";
+        return false;
+    }
+
+    b.instance = on.instance;
+    b.physical = on.physical;
+    b.device = on.device;
+    b.queue = on.queue;
+    b.queueFamily = on.family;
+    b.borrowed = true;
+    return Finish(d3d, why);
 }
 
 inline bool Create(ID3D12Device* d3d, std::string& why)
@@ -298,70 +543,9 @@ inline bool Create(ID3D12Device* d3d, std::string& why)
 
     vkGetDeviceQueue(b.device, b.queueFamily, 0, &b.queue);
 
-    b.importSemaphore = reinterpret_cast<PFN_vkImportSemaphoreWin32HandleKHR>(
-        vkGetDeviceProcAddr(b.device, "vkImportSemaphoreWin32HandleKHR"));
-    if (b.importSemaphore == nullptr)
-    {
-        why = "the device has no vkImportSemaphoreWin32HandleKHR";
-        return false;
-    }
-
-    b.memoryHandleProperties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
-        vkGetDeviceProcAddr(b.device, "vkGetMemoryWin32HandlePropertiesKHR"));
-    if (b.memoryHandleProperties == nullptr)
-    {
-        why = "the device has no vkGetMemoryWin32HandlePropertiesKHR";
-        return false;
-    }
-
-    VkCommandPoolCreateInfo poolInfo { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    poolInfo.queueFamilyIndex = b.queueFamily;
-
-    if (vkCreateCommandPool(b.device, &poolInfo, nullptr, &b.pool) != VK_SUCCESS)
-    {
-        why = "vkCreateCommandPool failed";
-        return false;
-    }
-
-    VkCommandBufferAllocateInfo alloc { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    alloc.commandPool = b.pool;
-    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc.commandBufferCount = 3;
-
-    if (vkAllocateCommandBuffers(b.device, &alloc, b.cmd) != VK_SUCCESS)
-    {
-        why = "vkAllocateCommandBuffers failed";
-        return false;
-    }
-
-    for (uint32_t i = 0; i < 3; ++i)
-    {
-        VkFenceCreateInfo fenceInfo { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // the first use of a slot has nothing to wait for
-        if (vkCreateFence(b.device, &fenceInfo, nullptr, &b.done[i]) != VK_SUCCESS)
-        {
-            why = "vkCreateFence failed";
-            return false;
-        }
-    }
-
-    ID3D12Fence* to = nullptr;
-    ID3D12Fence* from = nullptr;
-    b.toVkSem = ShareAndImportFence(d3d, &to, why);
-    if (b.toVkSem == VK_NULL_HANDLE)
-        return false;
-    b.toVk = to;
-
-    why.clear();
-    b.fromVkSem = ShareAndImportFence(d3d, &from, why);
-    if (b.fromVkSem == VK_NULL_HANDLE)
-        return false;
-    b.fromVk = from;
-
-    b.ready = true;
-    return true;
+    return Finish(d3d, why);
 }
+
 
 // One submission in the slot: wait for the value the game's queue has signalled, run whatever
 // is recorded (nothing yet), signal the value the game's queue will wait for. Returns a VkResult
@@ -370,7 +554,16 @@ inline bool Create(ID3D12Device* d3d, std::string& why)
 // `copy` and its two buffers are the slot's work, when it has any: one buffer-to-buffer copy,
 // which is what the reference's own fallback records in the network's place (its Passthrough).
 // A null `copy` is the handshake on its own, as it has been until now.
-inline VkResult Submit(uint64_t value, const VkBufferCopy* copy, VkBuffer from, VkBuffer to, std::string& why)
+// One buffer-to-buffer copy with the two buffers it moves between, because a VkBufferCopy
+// on its own names offsets and a size and nothing of what it is moving.
+struct Transfer
+{
+    VkBuffer from = VK_NULL_HANDLE;
+    VkBuffer to = VK_NULL_HANDLE;
+    VkBufferCopy region {};
+};
+
+inline VkResult Submit(uint64_t value, const Transfer* transfers, uint32_t count, bool signal, std::string& why)
 {
     Bridge& b = TheBridge();
     if (!b.ready)
@@ -432,8 +625,11 @@ inline VkResult Submit(uint64_t value, const VkBufferCopy* copy, VkBuffer from, 
         return r;
     }
 
-    if (copy != nullptr)
-        vkCmdCopyBuffer(c, from, to, 1, copy);
+    if (transfers != nullptr)
+    {
+        for (uint32_t i = 0; i < count; ++i)
+            vkCmdCopyBuffer(c, transfers[i].from, transfers[i].to, 1, &transfers[i].region);
+    }
 
     r = vkEndCommandBuffer(c);
     if (r != VK_SUCCESS)
@@ -445,7 +641,7 @@ inline VkResult Submit(uint64_t value, const VkBufferCopy* copy, VkBuffer from, 
     VkTimelineSemaphoreSubmitInfo timeline { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
     timeline.waitSemaphoreValueCount = 1;
     timeline.pWaitSemaphoreValues = &value;
-    timeline.signalSemaphoreValueCount = 1;
+    timeline.signalSemaphoreValueCount = signal ? 1u : 0u;
     timeline.pSignalSemaphoreValues = &value;
 
     const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
@@ -457,13 +653,82 @@ inline VkResult Submit(uint64_t value, const VkBufferCopy* copy, VkBuffer from, 
     si.pWaitDstStageMask = &stage;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &c;
-    si.signalSemaphoreCount = 1;
+    si.signalSemaphoreCount = signal ? 1u : 0u;
     si.pSignalSemaphores = &b.fromVkSem;
 
     r = vkQueueSubmit(b.queue, 1, &si, b.done[slot]);
     if (r != VK_SUCCESS)
         why = "vkQueueSubmit failed";
+
+    b.lastFence = b.done[slot];
     return r;
+}
+
+// Wait for the game's queue itself to have reached the frame's producer half.
+//
+// This is a different wait from the two above, and is asked for separately because the two
+// are slow for different reasons when they are slow: this one is how far behind the game's
+// own queue is, and the fence wait below is how long the device takes over what the slot
+// asked of it. A slot that waits here is waiting for the frame to be rendered; one that
+// waits on the fence is waiting on the copy it just handed over.
+inline VkResult WaitGame(uint64_t value, std::string& why)
+{
+    Bridge& b = TheBridge();
+    if (!b.ready)
+    {
+        why = "the bridge is not up";
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkSemaphoreWaitInfo wait { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    wait.semaphoreCount = 1;
+    wait.pSemaphores = &b.toVkSem;
+    wait.pValues = &value;
+
+    const VkResult r = vkWaitSemaphores(b.device, &wait, kSlotWaitNs);
+    if (r != VK_SUCCESS)
+    {
+        why = r == VK_TIMEOUT ? "the game's queue has not reached the frame" : "vkWaitSemaphores failed";
+        return r;
+    }
+
+    return VK_SUCCESS;
+}
+
+// Wait for the submission handed out last to have finished on the device.
+//
+// The slot's own wait, above, is before the recording: it keeps a command buffer from
+// being written over while the GPU still holds it. This one is after, and exists for the
+// one caller that needs the bytes the submission moved -- the host cannot read a staging
+// buffer the device has not finished filling.
+//
+// Treated as lost after three timeouts, like the other: a queue that will not finish work
+// must not be given more, and a wait this long in the slot is a wait out of every frame
+// after it.
+inline VkResult WaitLast(std::string& why)
+{
+    Bridge& b = TheBridge();
+    if (b.lastFence == VK_NULL_HANDLE)
+    {
+        why = "nothing has been submitted";
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    const VkResult waited = vkWaitForFences(b.device, 1, &b.lastFence, VK_TRUE, kSlotWaitNs);
+    if (waited != VK_SUCCESS)
+    {
+        if (waited == VK_TIMEOUT)
+        {
+            b.timeouts += 1;
+            if (b.timeouts >= 3)
+                b.lost = true;
+        }
+        why = waited == VK_TIMEOUT ? "the last submission has not finished" : "vkWaitForFences failed";
+        return waited;
+    }
+
+    b.timeouts = 0;
+    return VK_SUCCESS;
 }
 
 } // namespace VulkanGap

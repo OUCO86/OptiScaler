@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include <nrbridge/NrBridge.h>
+#include <nrbridge/NrPipeline.h>
 
 #include "Config.h"
 #include "State.h"
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 // The command-list split, taken from the reference integration without modification. It is
 // included after everything of the host's, because it brings its own Detours header.
@@ -52,6 +54,13 @@ ID3D12Resource* ReadResource(NVSDK_NGX_Parameter* p, const char* key)
     if (p->Get(key, &r) != NVSDK_NGX_Result_Success)
         p->Get(key, reinterpret_cast<void**>(&r));
     return r;
+}
+
+using Clock = std::chrono::steady_clock;
+
+double ElapsedMs(Clock::time_point from, Clock::time_point to)
+{
+    return std::chrono::duration<double, std::milli>(to - from).count();
 }
 
 float ReadFloat(NVSDK_NGX_Parameter* p, const char* key, float fallback)
@@ -237,6 +246,22 @@ void EnsureSubmissionArmed(ID3D12Device* device, ID3D12CommandQueue* queue)
         return;
     }
 
+    /* Wrap the lists the game made before this point, and the reference says why in so
+     * many words beside this switch it owns: "UE can retain lists created before the first
+     * swapchain. Wrap only calls from the host executable during boot; Streamline and vendor
+     * modules stay native." (`SubmissionHooks.h`, above g_earlyExeWrap).
+     *
+     * This is that game. The log says what it costs: `declined=1813` against
+     * `cutsRecorded=586`, every decline reading "(not our list)" -- three evaluates out of
+     * four arrive with a command list the proxy never wrapped, so three frames out of four
+     * are shown the game's own colour, which is the flicker. The hook is armed here, once,
+     * on the swapchain's queue; lists created before it are still the game's own and no
+     * later switch reaches them.
+     *
+     * Turned on before `Arm` so that the boot-time creations are seen, and limited to the
+     * host executable, which is the reference's own limit -- wrapping Streamline's or a
+     * vendor module's lists is what the comment rules out. */
+    DlssNr::Submission::Hooks::SetEarlyExeWrap(true);
     DlssNr::Submission::Hooks::SetProxyWrap(true);
     DlssNr::Submission::Hooks::SetWrapOpenLists(true);
     const auto hr = DlssNr::Submission::Hooks::Arm(device, queue);
@@ -297,8 +322,24 @@ struct Gap
     // handshake alone. The two not adding up to the number of runs is the interesting case.
     std::atomic<unsigned long long> copies { 0 };
     std::atomic<unsigned long long> noWork { 0 };
+    // How many of those ran the network rather than the passthrough, and how many fell
+    // back to it. The two not adding up to the number of copies is the interesting case.
+    std::atomic<unsigned long long> netRuns { 0 };
     std::atomic<double> cpuTotalMs { 0.0 };
     std::atomic<double> cpuMaxMs { 0.0 };
+
+    // The run split into the five steps it is made of: the game's queue told where the frame
+    // has got to, the frame read back, the device waited for, the pass, and the answer sent
+    // back. A run that is slow is slow in one of these, and which one it is cannot be told
+    // from the total -- the total only says that one of them is.
+    std::atomic<double> stepSignalMs { 0.0 };
+    std::atomic<double> stepReadMs { 0.0 };
+    // `wait` is how far behind the game's own queue was; `fence` is what the hand-over's
+    // own copy cost. Both were one number before, and one number could not say which.
+    std::atomic<double> stepWaitMs { 0.0 };
+    std::atomic<double> stepFenceMs { 0.0 };
+    std::atomic<double> stepWorkMs { 0.0 };
+    std::atomic<double> stepWriteMs { 0.0 };
 };
 
 Gap& TheGap()
@@ -309,12 +350,18 @@ Gap& TheGap()
     return g;
 }
 
-bool BuildGap(ID3D12Device* device)
+// `on`, where it is not null, is the device the network runs on: the hand-over is
+// then built on it rather than beside it, which is the shape the reference has (one
+// Vulkan device and one queue for both halves of the bridge). Without it a second
+// device of our own is made, and the two do not share a queue to be ordered on.
+bool BuildGap(ID3D12Device* device, const VulkanGap::Borrowed* on = nullptr)
 {
     Gap& g = TheGap();
 
     std::string why;
-    if (!VulkanGap::Create(device, why))
+    const bool made = on != nullptr ? VulkanGap::CreateOn(device, *on, why)
+                                    : VulkanGap::Create(device, why);
+    if (!made)
     {
         g.failure = "VulkanGap: " + why;
         return false;
@@ -330,6 +377,26 @@ bool BuildGap(ID3D12Device* device)
 
     g.ready = true;
     return true;
+}
+
+// Where the network's pieces are: libxmx, the resident shaders, and the plan's own blob
+// file, all of them written by the dump that recorded the plan. A directory rather than a
+// search, because a network is a build and a build has to be the one that was checked.
+std::filesystem::path NrFolder()
+{
+    const std::string configured = Config::Instance()->NrFolder.value_or_default();
+    if (!configured.empty())
+        return std::filesystem::path(configured);
+
+    return std::filesystem::path("E:\\WorkBuddy\\2026-10-09-04-20-55\\src\\dlss-nr-on-a770\\work");
+}
+
+// Whether the pass is allowed to move the history by the frame's motion. The identity is
+// what the layer has always had and is right wherever the scene stood still; this is the
+// switch that says whether to try to be right where it moved too.
+bool ReprojectHistory()
+{
+    return Config::Instance()->NrMvReproject.value_or_default();
 }
 
 // The reference's EnqueueHipFn, called by BetweenThunk between the two halves.
@@ -350,7 +417,26 @@ int32_t EnqueueGap(void* session, void* job, void* command_queue)
             g.failures.fetch_add(1, std::memory_order_relaxed);
             return -1;
         }
-        if (!BuildGap(g.device.Get()))
+        // The network's device, if there is one: the hand-over goes on it.
+        auto* early = static_cast<NrBridge::Backend*>(session);
+        NrBridge::DeviceHandles had {};
+        VulkanGap::Borrowed on {};
+        const bool borrowed = early != nullptr && early->NetworkDevice(&had);
+        if (borrowed)
+        {
+            on.instance = reinterpret_cast<VkInstance>(had.instance);
+            on.physical = reinterpret_cast<VkPhysicalDevice>(had.physical);
+            on.device = reinterpret_cast<VkDevice>(had.device);
+            on.queue = reinterpret_cast<VkQueue>(had.queue);
+            on.family = had.family;
+        }
+        // Said once, because the two shapes look alike and only one of them reads the
+        // frame: two devices of our own, each importing the same shared resource, do not
+        // share a queue to be ordered on, and the answer comes back wrong.
+        LOG_INFO("NrBridge: the hand-over stands on {}",
+                 borrowed ? "the network's device" : "a device of its own");
+
+        if (!BuildGap(g.device.Get(), borrowed ? &on : nullptr))
         {
             g.failures.fetch_add(1, std::memory_order_relaxed);
             return -1;
@@ -367,7 +453,9 @@ int32_t EnqueueGap(void* session, void* job, void* command_queue)
     // the frame's producer half completes before any of this runs.
     const UINT64 value = g.nextValue++;
     auto& vk = VulkanGap::TheBridge();
+    const auto tSignal = Clock::now();
     const HRESULT hr = queue->Signal(vk.toVk.Get(), value);
+    const auto tRead = Clock::now();
     g.signalled.store(value, std::memory_order_relaxed);
 
     if (FAILED(hr))
@@ -377,33 +465,126 @@ int32_t EnqueueGap(void* session, void* job, void* command_queue)
         return -1;
     }
 
-    // What the slot runs, when the frame has buffers: one copy, in the network's place, which
-    // is the reference's Passthrough. It is asked for before the submit because the answer
-    // decides whether the submit carries work at all -- no buffers, no copy, and the handshake
-    // on its own is still what gets measured.
-    VkBufferCopy copy {};
-    VkBuffer from = VK_NULL_HANDLE, to = VK_NULL_HANDLE;
+    // What the slot runs: the network where the reference has its renderer, or the
+    // reference's Passthrough where there is none.
+    //
+    // The network needs two submissions, because the host's work is between them and cannot
+    // be inside either: one that carries the frame's pixels to a buffer the host can read,
+    // and one that carries the answer back. The first signals nothing -- it is not the
+    // answer, it is the question -- and between the two the host waits for the device once
+    // and does the pass.
+    //
+    // A pass that will not come up, or whose submission will not go, falls back to the
+    // passthrough rather than to nothing: a frame the slot does not answer is a frame whose
+    // continuation half reads a buffer nobody wrote.
     auto* host = static_cast<NrBridge::Backend*>(session);
-    const bool work = host != nullptr && host->SlotCopy(&copy, &from, &to);
-    if (work)
-        g.copies.fetch_add(1, std::memory_order_relaxed);
-    else
-        g.noWork.fetch_add(1, std::memory_order_relaxed);
-
     std::string why;
-    const VkResult vr = VulkanGap::Submit(value, work ? &copy : nullptr, from, to, why);
-    if (vr != VK_SUCCESS)
+
+    bool answered = false;
+    VulkanGap::Transfer transfers[2] {};
+    UINT moving = 0;
+
+    if (host != nullptr && Config::Instance()->NrNetwork.value_or_default() && host->SlotRead(transfers, moving))
     {
-        // Recorded, and left for the next frame: a Wait on a value nothing signalled would stop
-        // the game's queue rather than slow it, so nothing is queued for it here.
-        //
-        // The reason is kept, not accumulated. A reason appended on every failure makes the log
-        // line grow with the frame count, and a log line that grows is a log that stops being
-        // readable exactly when the failure it describes is being looked for.
-        g.vkFailures.fetch_add(1, std::memory_order_relaxed);
-        g.failure = why + " (" + std::to_string(static_cast<int>(vr)) + ")";
-        g.failures.fetch_add(1, std::memory_order_relaxed);
-        return -1;
+        const VkResult read = VulkanGap::Submit(value, transfers, moving, false, why);
+        const auto tWait = Clock::now();
+
+        // Two waits, timed apart. The first is the game's queue getting to the frame's
+        // producer half; the second is the device finishing the copy the slot just handed
+        // it. Both are inside the one `wait` the log used to print, and they are not the
+        // same wait: one is how far behind the game is, the other is what the hand-over
+        // itself costs.
+        const bool reached = read == VK_SUCCESS && VulkanGap::WaitGame(value, why) == VK_SUCCESS;
+        const auto tFence = Clock::now();
+        const bool waited = reached && VulkanGap::WaitLast(why) == VK_SUCCESS;
+        const auto tWork = Clock::now();
+
+        if (waited && host->SlotWork(value))
+        {
+            const auto tWrite = Clock::now();
+            UINT writing = 0;
+            if (host->SlotWrite(transfers, writing))
+            {
+                if (writing != 0)
+                {
+                    moving = writing;
+                    const VkResult wrote = VulkanGap::Submit(value, transfers, moving, true, why);
+                    answered = wrote == VK_SUCCESS;
+                    if (!answered)
+                    {
+                        g.vkFailures.fetch_add(1, std::memory_order_relaxed);
+                        g.failure = why + " (" + std::to_string(static_cast<int>(wrote)) + ")";
+                    }
+                }
+                else
+                {
+                    // The fused path: the network wrote the answer into the game's own
+                    // buffer, so there is nothing to carry back -- but the handshake is
+                    // still owed. Mochi's shape is that the network runs on the Vulkan
+                    // queue after the value the game signalled and signals the next
+                    // (docs/ARCHITECTURE.md), which is this submit with no copies in it.
+                    //
+                    // Without the submit nothing signals `fromVk` and the game's queue
+                    // waits for a value that will never arrive; with the passthrough
+                    // instead, the input is copied over what the network just wrote.
+                    const VkResult wrote = VulkanGap::Submit(value, nullptr, 0, true, why);
+                    answered = wrote == VK_SUCCESS;
+                    if (!answered)
+                    {
+                        g.vkFailures.fetch_add(1, std::memory_order_relaxed);
+                        g.failure = why + " (" + std::to_string(static_cast<int>(wrote)) + ")";
+                    }
+                }
+            }
+            const auto tDone = Clock::now();
+            g.stepSignalMs.store(ElapsedMs(tSignal, tRead), std::memory_order_relaxed);
+            g.stepReadMs.store(ElapsedMs(tRead, tWait), std::memory_order_relaxed);
+            g.stepWaitMs.store(ElapsedMs(tWait, tFence), std::memory_order_relaxed);
+            g.stepFenceMs.store(ElapsedMs(tFence, tWork), std::memory_order_relaxed);
+            g.stepWorkMs.store(ElapsedMs(tWork, tWrite), std::memory_order_relaxed);
+            g.stepWriteMs.store(ElapsedMs(tWrite, tDone), std::memory_order_relaxed);
+        }
+    }
+
+    if (answered)
+    {
+        g.copies.fetch_add(1, std::memory_order_relaxed);
+        g.netRuns.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        // The reference's Passthrough: one copy, in the network's place. It is asked for
+        // before the submit because the answer decides whether the submit carries work at
+        // all -- no buffers, no copy, and the handshake on its own is still what gets
+        // measured.
+        VkBufferCopy copy {};
+        VkBuffer from = VK_NULL_HANDLE, to = VK_NULL_HANDLE;
+        const bool work = host != nullptr && host->SlotCopy(&copy, &from, &to);
+        if (work)
+            g.copies.fetch_add(1, std::memory_order_relaxed);
+        else
+            g.noWork.fetch_add(1, std::memory_order_relaxed);
+
+        transfers[0].from = from;
+        transfers[0].to = to;
+        transfers[0].region = copy;
+
+        const VkResult vr = VulkanGap::Submit(value, work ? transfers : nullptr, work ? 1u : 0u, true, why);
+        if (vr != VK_SUCCESS)
+        {
+            // Recorded, and left for the next frame: a Wait on a value nothing signalled
+            // would stop the game's queue rather than slow it, so nothing is queued for it
+            // here.
+            //
+            // The reason is kept, not accumulated. A reason appended on every failure makes
+            // the log line grow with the frame count, and a log line that grows is a log
+            // that stops being readable exactly when the failure it describes is being
+            // looked for.
+            g.vkFailures.fetch_add(1, std::memory_order_relaxed);
+            g.failure = why + " (" + std::to_string(static_cast<int>(vr)) + ")";
+            g.failures.fetch_add(1, std::memory_order_relaxed);
+            return -1;
+        }
     }
 
     g.vkSubmits.fetch_add(1, std::memory_order_relaxed);
@@ -432,8 +613,31 @@ int32_t EnqueueGap(void* session, void* job, void* command_queue)
     {
     }
 
-    if (announce)
-        LOG_INFO("NrBridge gap run #{}: queue={} value={} took={:.3f}ms", run, command_queue, value, ms);
+    // Announced for the first few runs and then every fiftieth: the first run carries the
+    // network's own build and says nothing about a frame, and a run every fifty is close
+    // enough to watch a number that is drifting without filling the log with it.
+    if (announce || run % 50 == 0)
+    {
+        // The pass's own split travels in the same line: the device's wait and the host's
+        // work are the two halves of `work` above, and seeing them beside it is what tells
+        // a slow pass from a pass that waited.
+        const double hostMs = host != nullptr
+                                  ? host->LastCopyMs() + host->LastDecodeMs() + host->LastMotionMs() +
+                                        host->LastNetMs() + host->LastFeaturesMs() + host->LastComposeMs() +
+                                        host->LastEncodeMs()
+                                  : 0.0;
+        LOG_INFO("NrBridge gap run #{}: queue={} value={} took={:.3f}ms | signal={:.3f} read={:.3f} wait={:.3f} "
+                 "fence={:.3f} work={:.3f} write={:.3f} | copy={:.3f} decode={:.3f} mv={:.3f} features={:.3f} "
+                 "net={:.3f} compose={:.3f} encode={:.3f} (host {:.3f})",
+                 run, command_queue, value, ms,
+                 g.stepSignalMs.load(std::memory_order_relaxed), g.stepReadMs.load(std::memory_order_relaxed),
+                 g.stepWaitMs.load(std::memory_order_relaxed), g.stepFenceMs.load(std::memory_order_relaxed),
+                 g.stepWorkMs.load(std::memory_order_relaxed), g.stepWriteMs.load(std::memory_order_relaxed),
+                 host != nullptr ? host->LastCopyMs() : 0.0, host != nullptr ? host->LastDecodeMs() : 0.0,
+                 host != nullptr ? host->LastMotionMs() : 0.0, host != nullptr ? host->LastFeaturesMs() : 0.0,
+                 host != nullptr ? host->LastNetMs() : 0.0, host != nullptr ? host->LastComposeMs() : 0.0,
+                 host != nullptr ? host->LastEncodeMs() : 0.0, hostMs);
+    }
 
     return 0;
 }
@@ -547,12 +751,17 @@ void LogFrame(const NrBridge::Frame& f)
     // slot's own counters are deliberately not used to judge this: with nothing enqueued the
     // reference's BetweenThunk returns before it counts anything, so they read zero whether or
     // not the slot ran.
-    LOG_INFO("NrBridge boundary: eval={} cutHr={:X} proxyHits={} cutsRecorded={} rejected={} "
+    // `declined` is on this line because a frame the game would not let us cut is a frame
+    // that shows the game its own colour instead of the network's answer, and that is the
+    // whole difference between a picture that is denoised and one that flickers. The count
+    // was being kept and never printed, which is why the flicker had no number on it.
+    LOG_INFO("NrBridge boundary: eval={} cutHr={:X} proxyHits={} cutsRecorded={} rejected={} declined={} "
              "unsplitSubmitted={} producerSubmitted={} continuationSubmitted={} submitFailures={} "
              "(counts are NOT GPU completion)",
              n, static_cast<unsigned>(g_lastCutHr.load(std::memory_order_relaxed)),
              g_splitOk.load(std::memory_order_relaxed) + g_splitFailed.load(std::memory_order_relaxed),
              g_splitOk.load(std::memory_order_relaxed), g_splitFailed.load(std::memory_order_relaxed),
+             g_splitNoProxy.load(std::memory_order_relaxed),
              DlssNr::Submission::g_unsplitProxySubmissions.load(std::memory_order_relaxed),
              DlssNr::Submission::g_splitSubmissions.load(std::memory_order_relaxed),
              DlssNr::Submission::g_continuationSubmissions.load(std::memory_order_relaxed),
@@ -591,6 +800,27 @@ void LogFrame(const NrBridge::Frame& f)
              gap.copies.load(std::memory_order_relaxed), gap.noWork.load(std::memory_order_relaxed),
              vk.lost ? " (vk given up on after " + std::to_string(vk.timeouts) + " timeouts)" : "",
              toVkDone, vk.seenToVk, fromVkDone, vk.seenFromVk, signalled);
+
+    // What the pass itself did, on the frame it last ran. Printed beside the slot's own
+    // counts because the two answer different questions: the slot's say whether the gap
+    // ran, and these say what the network answered when it did. A gate near 0.7 is a
+    // history the model is accepting; near 0.03 is one it is rejecting, which on a scene
+    // that moves is what a wrong reprojection looks like.
+    auto* backend = g_backend.load(std::memory_order_acquire);
+    if (backend != nullptr)
+    {
+        const char* refused = backend->NetworkFailure();
+        const std::string state = backend->NetworkUp() ? "up"
+                                  : (refused != nullptr && *refused != '\0') ? refused
+                                                                             : "never tried";
+        LOG_INFO("NrBridge pass: network={} copy={:.2f} decode={:.2f} mv={:.2f} features={:.2f} net={:.2f} "
+                 "compose={:.2f} encode={:.2f}ms | gate={:.3f} head mean={:.4f} peak={:.1f} | colour in [{:.3f}, "
+                 "{:.3f}]",
+                 state, backend->LastCopyMs(), backend->LastDecodeMs(), backend->LastMotionMs(),
+                 backend->LastFeaturesMs(), backend->LastNetMs(), backend->LastComposeMs(), backend->LastEncodeMs(),
+                 backend->LastGate(),
+                 backend->LastHeadMean(), backend->LastHeadPeak(), backend->LastLow(), backend->LastHigh());
+    }
 }
 
 // Built on first use and never rebuilt, matching the reference: it builds what it needs on first
@@ -660,8 +890,17 @@ struct Backend::Impl
     // frame that is being recorded.
     UINT width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT motionFormat = DXGI_FORMAT_UNKNOWN;
+    UINT mvWidth = 0, mvHeight = 0;
     NrBridge::Footprint footprint;
+
+    // The motion vectors cross in a buffer of their own: their format is not the colour's, so
+    // their footprint is not either, and a copy described with the colour's would tear them.
+    // Their extent is theirs too, and is taken from the same place the colour's is taken from
+    // when the frame does not report one: the texture itself.
+    NrBridge::Footprint mvFootprint;
     NrBridge::SharedBuffer input, output;
+    NrBridge::SharedBuffer mvInput;
     Microsoft::WRL::ComPtr<ID3D12Resource> result;
 
     // The state the result texture is actually in, as far as this module's own transitions go:
@@ -672,17 +911,63 @@ struct Backend::Impl
     // The set that was in use before the last change of geometry, kept because the GPU may
     // still be reading it: what frees it is the next change, which is at least one frame
     // later, and a frame's work has been waited on by then.
-    NrBridge::SharedBuffer oldInput, oldOutput;
+    NrBridge::SharedBuffer oldInput, oldOutput, oldMvInput;
     Microsoft::WRL::ComPtr<ID3D12Resource> oldResult;
 
+    // The network, and the buffers the host works in.
+    //
+    // The shared buffers the frame crosses in are device-local, which is what importing a
+    // D3D12 allocation asks for and what the host cannot read. So a frame that the network
+    // is to see crosses twice more, into and out of three of its own: colour and motion on
+    // the way in, the composed frame on the way out.
+    NrBridge::Pipeline network;
+    bool networkTried = false;
+    std::string networkFailure;
+
+    VulkanGap::Staging stageColour, stageMotion, stageResult;
+    std::vector<float> hostColour, hostMotion, hostResult;
+
+    // The same three frames again, in the host's own memory, and the reason they exist:
+    // a staging buffer is the device's memory mapped through BAR, and reading it one pixel
+    // at a time is a PCIe round trip per pixel -- measured at 230 ns a pixel, which is
+    // three quarters of the frame's time, against the 1.6 ms the same number of pixels
+    // costs in memory the host owns. So the frame is taken across in one copy, worked on
+    // here, and taken back in one copy: the passes never touch a mapped pointer.
+    std::vector<uint8_t> rawColour, rawMotion, rawResult;
+
+    // The frame's motion, as the host needs it: the vectors are uv, and the shift they
+    // stand for is in pixels of the frame's own extent -- the reference's own reading of
+    // them, `motionScaleX = motion_scale_x / motionWidth`, times that extent.
+    float pixelsPerUvX = 0, pixelsPerUvY = 0;
+    float preExposure = 1;
+    bool freshHistory = true;
+    int probeTick = 0;
+    int passTick = 0;
+    bool profiling = false;
+    bool haveMotion = false;
+
+    // What the pass cost, and what it answered, for the log.
+    double lastFeaturesMs = 0, lastNetMs = 0, lastComposeMs = 0;
+    // What the pass spends around the network: the frame out of the game's format, the vectors
+    // out of theirs, and the answer back into the game's. Timed separately from the network
+    // because they are the host's own work, and because a frame that is slow for one of these
+    // reasons is slow in a different place from one that is slow for the network's.
+    double lastDecodeMs = 0, lastMotionMs = 0, lastEncodeMs = 0;
+    // What the two one-copy crossings cost. Kept apart from the three above: if this is
+    // where the time went instead, the frame did not get cheaper, it only moved.
+    double lastCopyMs = 0;
+    float lastGate = 0, lastHeadMean = 0, lastHeadPeak = 0;
+    float lastLow = 0, lastHigh = 0;
+
     std::string bufferFailure;
-    bool BuildBuffers(ID3D12Resource* colour, UINT w, UINT h);
+    bool BuildBuffers(ID3D12Resource* colour, ID3D12Resource* motion, UINT w, UINT h);
+    bool EnsureNetwork(UINT w, UINT h);
 };
 
 // The frame's buffers, made the first time and whenever the frame's geometry is not the one
 // they were made for. A failure is recorded and the frame is left alone, which is the same
 // answer the reference gives: pass the frame through rather than fail it.
-bool Backend::Impl::BuildBuffers(ID3D12Resource* colour, UINT w, UINT h)
+bool Backend::Impl::BuildBuffers(ID3D12Resource* colour, ID3D12Resource* motion, UINT w, UINT h)
 {
     if (colour == nullptr || w == 0 || h == 0)
     {
@@ -691,19 +976,39 @@ bool Backend::Impl::BuildBuffers(ID3D12Resource* colour, UINT w, UINT h)
     }
 
     const auto desc = colour->GetDesc();
-    if (input.buffer != VK_NULL_HANDLE && width == w && height == h && format == desc.Format)
+
+    // The motion vectors' format is part of what the buffers are made for: a frame whose motion
+    // changed format without changing extent has to be made again all the same.
+    const DXGI_FORMAT mvFormat = motion != nullptr ? motion->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
+    const UINT mvW = motion != nullptr ? static_cast<UINT>(motion->GetDesc().Width) : 0;
+    const UINT mvH = motion != nullptr ? static_cast<UINT>(motion->GetDesc().Height) : 0;
+    // `input.resource`, not `input.buffer`, and the difference is the whole frame.
+    //
+    // `buffer` is the handle's image on the hand-over's own Vulkan device, and the fused
+    // path deliberately never makes one: the network's device imports the shared handle
+    // instead (VulkanGap::CreateOn). So this test could never be true under fused, and
+    // every frame fell through and rebuilt all four buffers. A rebuild makes a new D3D12
+    // resource and a new shared handle, while `nr_net_fuse` -- asked once, before the
+    // open -- still holds the handle the first frame had. The network therefore reads a
+    // resource nobody writes any more, and the colour it reads never changes: that is
+    // what a fixed `in mean` of 0.1731 in the log was, across a moving camera.
+    if (input.resource != nullptr && width == w && height == h && format == desc.Format &&
+        motionFormat == mvFormat && mvWidth == mvW && mvHeight == mvH)
         return true;
 
     oldInput.Release();
     oldOutput.Release();
+    oldMvInput.Release();
     oldResult.Reset();
 
     oldInput = input;
     oldOutput = output;
+    oldMvInput = mvInput;
     oldResult = result;
 
     input = {};
     output = {};
+    mvInput = {};
     result.Reset();
     resultState = D3D12_RESOURCE_STATE_COMMON;
 
@@ -726,6 +1031,35 @@ bool Backend::Impl::BuildBuffers(ID3D12Resource* colour, UINT w, UINT h)
         return false;
     }
 
+    // The motion vectors get a buffer of their own, described by a footprint of their own: the
+    // copy that fills it is a texture copy, and one described with the colour's footprint would
+    // read them at the colour's texel size. A frame that has no motion, or whose format has no
+    // footprint, keeps its colour path -- the temporal work is what goes without, and deciding
+    // what to do about that is not this module's.
+    if (motion != nullptr)
+    {
+        NrBridge::Footprint mfp(mvFormat, mvW, mvH);
+        if (!mfp.valid())
+        {
+            static std::atomic<bool> saidMvFormat { false };
+            if (!saidMvFormat.exchange(true, std::memory_order_relaxed))
+                LOG_WARN("NrBridge: the motion format {} has no footprint; motion is not carried",
+                         static_cast<int>(mvFormat));
+        }
+        else if (!mvInput.Create(device, mfp.bytes, why))
+        {
+            static std::atomic<bool> saidMvBuffer { false };
+            if (!saidMvBuffer.exchange(true, std::memory_order_relaxed))
+                LOG_WARN("NrBridge: the motion buffer could not be made ({}); motion is not carried", why);
+            mfp = NrBridge::Footprint();
+        }
+        mvFootprint = mfp;
+    }
+    else
+    {
+        mvFootprint = NrBridge::Footprint();
+    }
+
     D3D12_HEAP_PROPERTIES hp {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
@@ -739,11 +1073,83 @@ bool Backend::Impl::BuildBuffers(ID3D12Resource* colour, UINT w, UINT h)
         return false;
     }
 
+    // The host's own three, sized by the same footprints. A frame whose motion is not
+    // carried works without one: the pass runs, and its history stands still.
+    std::string stagingFailure;
+    if (!stageColour.Create(fp.bytes, stagingFailure))
+    {
+        bufferFailure = "staging " + stagingFailure;
+        return false;
+    }
+    if (!stageResult.Create(fp.bytes, stagingFailure))
+    {
+        bufferFailure = "staging " + stagingFailure;
+        return false;
+    }
+    stageMotion.Release();
+    hostMotion.clear();
+    if (mvFootprint.valid() && mvInput.resource != nullptr && !stageMotion.Create(mvFootprint.bytes, stagingFailure))
+    {
+        static std::atomic<bool> saidMotionStage { false };
+        if (!saidMotionStage.exchange(true, std::memory_order_relaxed))
+            LOG_WARN("NrBridge: the motion staging buffer could not be made ({}); the history stands still",
+                     stagingFailure);
+    }
+
+    hostColour.assign(size_t(w) * h * 3, 0.0f);
+    hostResult.assign(size_t(w) * h * 3, 0.0f);
+    if (stageMotion.buffer != VK_NULL_HANDLE)
+        hostMotion.assign(size_t(mvW) * mvH * 2, 0.0f);
+
+    // The host's own copies of the three staging buffers, byte for byte. Sized from the
+    // same footprints, including the row pitch, so the copy across is the whole buffer and
+    // not a guess at how wide a row is.
+    rawColour.assign(size_t(fp.bytes), 0);
+    rawResult.assign(size_t(fp.bytes), 0);
+    if (stageMotion.buffer != VK_NULL_HANDLE)
+        rawMotion.assign(size_t(mvFootprint.bytes), 0);
+    else
+        rawMotion.clear();
+
     footprint = fp;
     width = w;
     height = h;
     format = desc.Format;
+    motionFormat = mvFormat;
+    mvWidth = mvW;
+    mvHeight = mvH;
     bufferFailure.clear();
+    return true;
+}
+
+// The network, built once and on the first frame that needs it.
+//
+// A quarter second of device work and three hundred megabytes of weights read back into
+// it, which is why it is not built with the buffers: a frame that never reaches the slot
+// -- every frame before the first cut, which is the whole of a game's opening menu --
+// would pay for a network it never uses.
+bool Backend::Impl::EnsureNetwork(UINT w, UINT h)
+{
+    if (network.Ready())
+        return true;
+    if (networkTried)
+        return false;
+
+    networkTried = true;
+
+    const auto started = std::chrono::steady_clock::now();
+
+    std::string why;
+    if (!network.Prepare(w, h, NrFolder(), why))
+    {
+        networkFailure = why;
+        LOG_WARN("NrBridge: the network did not come up ({}): frames go through", why);
+        return false;
+    }
+
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    LOG_INFO("NrBridge: network up in {:.0f} ms on {}x{} (field {}x{}) from {}", ms, w, h, network.NetWidth(),
+             network.NetHeight(), NrFolder().string());
     return true;
 }
 
@@ -768,7 +1174,110 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
     const UINT w = f.width != 0 ? f.width : static_cast<UINT>(desc.Width);
     const UINT h = f.height != 0 ? f.height : static_cast<UINT>(desc.Height);
 
-    const bool haveBuffers = p->BuildBuffers(f.colour, w, h);
+    // What the host needs of the frame besides its pixels: the exposure the game scaled the
+    // scene by, and how far the vectors move a pixel. The reference's own reading of the
+    // scale, `motionScaleX = motion_scale_x / motionWidth`, is a shift in uv; the pass wants
+    // it in pixels of the frame's extent.
+    p->preExposure = f.preExposure > 0.0f ? f.preExposure : 1.0f;
+    // A frame that asks for a reset, or the first one, has nothing behind it: the input
+    // pass then repeats the colour in the history's channels, which is what the vendor's
+    // first-frame layout does (nr_image.c feature_pixel, "was ? ... : scaled").
+    if (f.reset)
+        p->freshHistory = true;
+    p->pixelsPerUvX = 0;
+    p->pixelsPerUvY = 0;
+    p->haveMotion = false;
+    if (p->mvWidth != 0 && p->mvHeight != 0)
+    {
+        p->pixelsPerUvX = f.motionScaleX / float(p->mvWidth) * float(w);
+        p->pixelsPerUvY = f.motionScaleY / float(p->mvHeight) * float(h);
+    }
+
+    /* Jittered vectors, and the reference's answer, word for word
+     * (`ta_be_MochizukiBackend.cpp:223-224`):
+     *
+     *   // Jittered vectors cannot be used as the unjittered history flow without conversion.
+     *   frame.motion = input.motionJittered ? nullptr : input.motion;
+     *
+     * It does not compensate for them; it refuses them. Our pass cannot either: `nr_pre.comp`
+     * reprojects the history at `uv + mv * scale` with nothing that knows the frame was
+     * jittered, so a jittered vector is not a slightly wrong reprojection, it is the
+     * history read from the wrong place. And it is jittered here -- the log prints
+     * `jitter=(0.375,0.056)`, `(0.438,-0.241)`, `(0.406,0.352)`, moving every frame, and
+     * `IFeature.cpp:54` sets `_initFlags.JitteredMV` from `[JitterCancellation]`, which is
+     * also what puts `XESS_INIT_FLAG_JITTERED_MV` on XeSS's own init (XeSSFeature.cpp:75).
+     *
+     * The frame still runs. What it loses is the reprojection, so the network reads the
+     * history at this pixel's own place -- `prev_uv == uv`, which is the colour-only
+     * behaviour, and is the degradation the reference documents as verified rather than
+     * guessed (`notes/motion-source-plan.md`, quoting `motion_estimate.comp`):
+     * "where the match cannot be justified we write exactly zero, which makes prev_uv ==
+     * uv ... the degradation target is a verified state, not a guess." */
+    const bool vectorsUsable = !f.motionJittered;
+    if (!vectorsUsable)
+    {
+        static std::atomic<bool> saidJitter { false };
+        if (!saidJitter.exchange(true, std::memory_order_relaxed))
+            LOG_INFO("NrBridge: the game's vectors carry jitter (jitter=({:.3f},{:.3f})), so they "
+                     "are not given to the network: the history is read at this pixel's own place, "
+                     "as the reference does with jittered vectors",
+                     f.jitterX, f.jitterY);
+    }
+
+    /* Whether this frame can be cut at all, asked before anything is recorded on it --
+     * the reference's order and its reason, at `ta_be_MochizukiBackend.cpp:187-192`:
+     *
+     *   if (FAILED(cmd->QueryInterface(IID_PPV_ARGS(&logical))) || logical->IsSplitIneligible() ||
+     *       FAILED(cmd->QueryInterface(IID_PPV_ARGS(&resources))) || !resources->CanAppendCompute())
+     *   { p->Status("mochizuki: recording boundary unavailable; original frame"); return nullptr; }
+     *
+     * We asked after the copies were recorded, which is how twelve percent of every two
+     * hundred frames ended up colour-and-motion vectors recorded onto a list that could
+     * never be cut: `declined ... ours=false`, on a list the game holds and reuses, once
+     * every eight frames or so. Those frames ran nothing and showed the game its own
+     * colour, which beside the frames that were denoised is the flicker.
+     *
+     * It is not a different list each time -- the log shows one address repeated -- so it
+     * is not a race either: this list was never ours to begin with, and asking the proxy
+     * first is what tells us so while there is still nothing recorded on it. */
+    {
+        DlssNr::Submission::ILogicalCommandList* logical = nullptr;
+        DlssNr::Submission::IRecordingResources* resources = nullptr;
+        const bool haveLogical =
+            SUCCEEDED(cmd->QueryInterface(__uuidof(DlssNr::Submission::ILogicalCommandList),
+                                          reinterpret_cast<void**>(&logical))) && logical != nullptr;
+        const bool ineligible = haveLogical && logical->IsSplitIneligible();
+        const char* why = haveLogical ? logical->SplitRejectionReason() : "(not our list)";
+        const bool haveResources =
+            haveLogical && SUCCEEDED(logical->QueryInterface(
+                                   __uuidof(DlssNr::Submission::IRecordingResources),
+                                   reinterpret_cast<void**>(&resources))) &&
+            resources != nullptr;
+        const bool canCompute = haveResources && resources->CanAppendCompute();
+        if (resources != nullptr)
+            resources->Release();
+        if (logical != nullptr)
+            logical->Release();
+
+        if (!haveLogical || ineligible || !haveResources || !canCompute)
+        {
+            const auto no = g_splitNoProxy.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (no <= 12)
+                LOG_INFO("NrBridge: frame not cuttable: {} -- the original frame is shown, "
+                         "as the reference does", why ? why : "(none)");
+            g_lastCutHr.store(S_FALSE, std::memory_order_relaxed);
+            return nullptr;
+        }
+    }
+
+    const bool haveBuffers = p->BuildBuffers(f.colour, f.motion, w, h);
+
+    // The pass wants the vectors at the frame's own extent, because that is where it
+    // samples the history. At another extent they are not carried at all, and the history
+    // stands still, which is a frame the pass can still run on.
+    p->haveMotion = vectorsUsable && p->stageMotion.buffer != VK_NULL_HANDLE &&
+                    !p->hostMotion.empty() && p->mvWidth == w && p->mvHeight == h;
+
     if (!haveBuffers)
     {
         // Said once: a frame without buffers is a frame passed through, which is not worth a
@@ -783,7 +1292,27 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
     // in the producer half and is complete before the slot's wait is satisfied. The frame's
     // colour goes into the buffer the slot's copy reads from.
     if (haveBuffers)
+    {
         CopyToBuffer(cmd, f.colour, f.colourState, p->input.resource.Get(), p->footprint, w, h);
+
+        // The motion vectors cross in the same half of the cut and into a buffer of their own,
+        // for the same reason the colour does: whatever runs in the slot needs both, and either
+        // one on its own is a frame the other cannot be matched to. Nothing reads this buffer
+        // yet -- the slot's work is still the reference's passthrough -- but it is filled from
+        // here on, which is the part that has to be right before anything is asked to use it.
+        if (vectorsUsable && p->mvFootprint.valid() && p->mvInput.resource != nullptr)
+        {
+            CopyToBuffer(cmd, f.motion, f.motionState, p->mvInput.resource.Get(), p->mvFootprint,
+                         p->mvWidth, p->mvHeight);
+
+            // Printed for the first few frames only: what the motion copy was described with is
+            // what decides whether the vectors arrive whole, and it is worth seeing once.
+            if (p->recorded.load(std::memory_order_relaxed) < 3)
+                LOG_INFO("NrBridge mv: {}x{} fmt={} pitch={} bytes={}", p->mvWidth, p->mvHeight,
+                         static_cast<int>(p->motionFormat), p->mvFootprint.d3d.Footprint.RowPitch,
+                         p->mvFootprint.bytes);
+        }
+    }
 
     // The cut goes here because that is where the reference puts it, in
     // ta_be_MochizukiBackend.cpp:
@@ -815,7 +1344,67 @@ ID3D12Resource* Backend::Record(ID3D12GraphicsCommandList* cmd, const Frame& f, 
                                                      static_cast<ID3D12CommandList*>(cmd), nullptr);
     }
     else if (hr == S_FALSE)
-        g_splitNoProxy.fetch_add(1, std::memory_order_relaxed);
+    {
+        /* Not one of our lists, or the list would not split. Which of the two is the
+         * difference between a frame that is denoised and a frame that is only the game's
+         * own colour, and the reference already answers it: `SplitRejectionReason` is its
+         * own word for it, and asking it costs a call. Counted here rather than sampled,
+         * because the frames that are missing are exactly the ones a periodic line never
+         * lands on -- that is what made this look like a mystery for hours. */
+        const auto no = g_splitNoProxy.fetch_add(1, std::memory_order_relaxed) + 1;
+        const char* why = "(not our list)";
+        if (DlssNr::Submission::ILogicalCommandList* logical = nullptr;
+            SUCCEEDED(cmd->QueryInterface(__uuidof(DlssNr::Submission::ILogicalCommandList),
+                                          reinterpret_cast<void**>(&logical))) &&
+            logical != nullptr)
+        {
+            const char* said = logical->SplitRejectionReason();
+            why = said != nullptr && *said ? said : "(eligible but not split)";
+            logical->Release();
+        }
+        /* Which list it was, and whether it says it is ours. A list that reports itself as
+         * the game made it is a list the create hook never saw, and the one thing that
+         * explains thirteen percent of frames forever rather than only at the start: the
+         * hook is not covering every path the game makes a list on. `AssertMode` and the
+         * node mask are in the same line because they are the two other things the create
+         * hook refuses on. */
+        if (no <= 12)
+        {
+            /* What the list says about itself. `GetModuleFileNameA` came back empty last
+             * time, which only says the address is not inside a loaded module -- a COM
+             * object's own code is, but a list that reports itself as the game's means it
+             * never went through our create hook at all, and the two want different fixes.
+             * The interface name and the device pointer are what separate them. */
+            char who[256] = {};
+            HMODULE from = nullptr;
+            if (from == nullptr &&
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(cmd), &from))
+                GetModuleFileNameA(from, who, sizeof who - 1);
+
+            ID3D12Device* made = nullptr;
+            if (SUCCEEDED(cmd->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&made))) &&
+                made != nullptr)
+                made->Release();
+
+            const bool ours = [&] {
+                DlssNr::Submission::ILogicalCommandList* probe = nullptr;
+                if (FAILED(cmd->QueryInterface(__uuidof(DlssNr::Submission::ILogicalCommandList),
+                                               reinterpret_cast<void**>(&probe))) || probe == nullptr)
+                    return false;
+                probe->Release();
+                return true;
+            }();
+
+            LOG_INFO("NrBridge: cut #{} declined: {} (hr 0x{:x}) list {} module='{}' device={} "
+                     "ours={} armed={} proxyWrap={}",
+                     no, why, static_cast<unsigned>(hr), static_cast<void*>(cmd), who,
+                     static_cast<void*>(made), ours,
+                     DlssNr::Submission::Hooks::IsArmed(),
+                     DlssNr::Submission::Hooks::ProxyWrapEnabled());
+        }
+    }
     else
         g_splitFailed.fetch_add(1, std::memory_order_relaxed);
 
@@ -892,9 +1481,330 @@ bool Backend::SlotCopy(VkBufferCopy* region, VkBuffer* from, VkBuffer* to)
     *to = p->output.buffer;
     return true;
 }
+
+// The three calls that put the network in the slot, in the order the gap makes them.
+
+bool Backend::SlotRead(VulkanGap::Transfer* transfers, UINT& count)
+{
+    count = 0;
+    if (transfers == nullptr)
+        return false;
+
+    // The handle is what both paths need; the imported buffer is only for the one
+    // that carries the frame by copy.
+    if (p->input.handle == nullptr || !p->footprint.valid())
+        return false;
+
+    // The frame's own buffers, handed to the network once, before it is opened: after
+    // this the recording has the two fused passes in it and no staging is wanted.
+    if (!p->network.Fused())
+    {
+        std::string fusedWhy;
+        if (!p->network.Fuse(NrFolder(), reinterpret_cast<unsigned long long>(p->input.handle),
+                             p->mvInput.resource != nullptr
+                                 ? reinterpret_cast<unsigned long long>(p->mvInput.handle)
+                                 : 0ull,
+                             reinterpret_cast<unsigned long long>(p->output.handle),
+                             // The resource's own size, not the frame's footprint: the same
+                             // handle is imported on the device the network runs on, and an
+                             // import has to be the object the hand-over's import is (16 MB
+                             // floor and 64 KB rounding, SharedBuffer.h). A buffer imported
+                             // at the footprint's size is a different object from the one
+                             // behind the handle.
+                             p->input.size,
+                             p->mvInput.resource != nullptr ? p->mvInput.size : 0ull, p->output.size, p->width,
+                             p->height, p->footprint.d3d.Footprint.RowPitch / 4u, p->preExposure,
+                             fusedWhy))
+            LOG_WARN("NrBridge: the fused path would not start: {}", fusedWhy);
+    }
+
+    if (!p->EnsureNetwork(p->width, p->height))
+        return false;
+
+    // Nothing to stage: the graph reads the game's own buffer and writes its own answer.
+    if (p->network.Fused())
+        return true;
+
+    // The network did not take the frame, so this side carries it -- and carrying it is
+    // the only reason to import the handles here. Left unimported on the fused path, the
+    // network's device is the one device that imports them, as in the reference.
+    std::string importWhy;
+    if (!p->input.Import(importWhy) || !p->output.Import(importWhy) ||
+        p->stageColour.buffer == VK_NULL_HANDLE)
+        return false;
+
+    transfers[count].from = p->input.buffer;
+    transfers[count].to = p->stageColour.buffer;
+    transfers[count].region.srcOffset = 0;
+    transfers[count].region.dstOffset = 0;
+    transfers[count].region.size = p->footprint.bytes;
+    count += 1;
+
+    // The motion vectors cross in the same submission: the pass wants the frame's colour
+    // and the shift that produced it, and either on its own is a frame the other does not
+    // match. Without a buffer for them the pass still runs, and its history stands.
+    if (p->haveMotion && p->mvFootprint.valid() && p->stageMotion.buffer != VK_NULL_HANDLE &&
+        p->mvInput.Import(importWhy))
+    {
+        transfers[count].from = p->mvInput.buffer;
+        transfers[count].to = p->stageMotion.buffer;
+        transfers[count].region.srcOffset = 0;
+        transfers[count].region.dstOffset = 0;
+        transfers[count].region.size = p->mvFootprint.bytes;
+        count += 1;
+    }
+
+    return true;
+}
+
+bool Backend::SlotWork(UINT64 value)
+{
+    // The fused path: the graph reads the colour in the game's own buffer and writes the
+    // answer back into it, so there is nothing here to decode, nothing to compose and
+    // nothing to encode. The graph waits for the game's fence on the device, which is
+    // what `value` is for — the same value the game's queue was asked to signal.
+    if (p->network.Fused())
+    {
+        // The frame's own pre-exposure, before the graph is run. It is the frame's and
+        // not the open's: this game moves it between a quarter and all of it, and a
+        // divisor baked in when the network was opened over- or under-exposes every
+        // frame the game has moved away from since.
+        p->network.Exposure(p->preExposure, p->freshHistory);
+
+        /* Where the frame's time goes, in three parts: the CPU handing the work over,
+         * the CPU waiting for it, and the read-back. The pass timing that used to stand
+         * here is off now -- it writes 417 timestamps a frame and reads them back with
+         * WAIT, which blocks the CPU behind the device and shows up as input lag.
+         *
+         * It answered its question, though: 62ms a frame with nothing over 2.6ms in any of
+         * the 417, which is a frame slow somewhere the device's own clock cannot see. */
+        if (!p->profiling)
+        {
+            p->profiling = true;
+            p->network.StartSubmitTiming();
+        }
+
+        /* Every thirtieth frame, since that is ten of the slow ones at this cycle length
+         * and one report cannot then have missed one. */
+        if (p->passTick >= 30)
+        {
+            p->passTick = 0;
+            p->network.LogSubmitTiming();
+        }
+        else
+        {
+            p->passTick += 1;
+        }
+
+        // What came back, every thirtieth frame: the one number that says whether the
+        // network is answering with a picture or with noise. It costs a megabyte read
+        // that never reaches the frame, which is why it is not every frame.
+        if (++p->probeTick >= 30)
+        {
+            p->probeTick = 0;
+            float inMean = 0.0f, inLow = 0.0f, inHigh = 0.0f;
+            float outMean = 0.0f, outLow = 0.0f, outHigh = 0.0f;
+            // The colour that went in beside the answer that came out: two halves of one
+            // question, and a number that does not move while the camera does says the
+            // half on the left never held the frame.
+            const bool a = p->network.Probe(0, &inMean, &inLow, &inHigh);
+            const bool b = p->network.Probe(1, &outMean, &outLow, &outHigh);
+            float channels[48] = {};
+            p->network.ProbeFeatures(channels);
+            if (a && b)
+                LOG_INFO("NrBridge: in mean {:.4f} low {:.4f} high {:.4f} | out mean {:.4f} low {:.4f} high {:.4f} | exposure {:.3f}",
+                         inMean, inLow, inHigh, outMean, outLow, outHigh, p->preExposure);
+        }
+        p->freshHistory = false;   // every frame after this one has the last one behind it
+
+        const HANDLE fence = VulkanGap::TheBridge().toVkShared;
+        std::string why;
+        if (fence != nullptr &&
+            p->network.RunFused(reinterpret_cast<unsigned long long>(fence), value, why))
+            return true;
+
+        LOG_WARN("NrBridge: the fused pass did not run: {}", why);
+        return false;
+    }
+
+    const UINT w = p->width, h = p->height;
+    if (w == 0 || h == 0 || !p->network.Ready())
+        return false;
+
+    if (p->stageColour.mapped == nullptr || p->hostColour.empty() || p->hostResult.empty())
+        return false;
+    if (p->rawColour.size() != size_t(p->footprint.bytes) || p->rawResult.size() != size_t(p->footprint.bytes))
+        return false;
+
+    // Across in one copy each, before anything looks at a pixel. This is the whole reason
+    // the host has buffers of its own: one copy of four megabytes is a few milliseconds,
+    // where the same bytes read a pixel at a time through BAR cost a round trip each.
+    const auto tCopyIn = Clock::now();
+    std::memcpy(p->rawColour.data(), p->stageColour.mapped, size_t(p->footprint.bytes));
+    if (p->haveMotion && p->stageMotion.mapped != nullptr && p->rawMotion.size() == size_t(p->mvFootprint.bytes))
+        std::memcpy(p->rawMotion.data(), p->stageMotion.mapped, size_t(p->mvFootprint.bytes));
+
+    const auto tDecode = Clock::now();
+
+    // The colour, out of the format the game left it in and out of the exposure it was
+    // scaled by, and clipped to what the network was trained on.
+    NrBridge::DecodeColour(p->rawColour.data(), w, h, p->footprint.d3d.Footprint.RowPitch, p->preExposure,
+                           p->hostColour.data(), &p->lastLow, &p->lastHigh);
+
+    const auto tMotion = Clock::now();
+
+    // The vectors, in pixels. Not finite is not a shift, and a shift of a whole screen is
+    // not one either: both are a pixel that could not be tracked.
+    std::vector<float>* motion = nullptr;
+    if (p->haveMotion && p->stageMotion.mapped != nullptr && !p->hostMotion.empty() && !p->rawMotion.empty())
+    {
+        const uint8_t* rows = p->rawMotion.data();
+        const size_t pitch = p->mvFootprint.d3d.Footprint.RowPitch;
+
+        for (UINT y = 0; y < p->mvHeight; ++y)
+        {
+            const uint16_t* line = reinterpret_cast<const uint16_t*>(rows + y * pitch);
+            for (UINT x = 0; x < p->mvWidth; ++x)
+            {
+                const size_t at = (size_t(y) * p->mvWidth + x) * 2;
+                float u = NrBridge::HalfValue(line[x * 2 + 0]);
+                float v = NrBridge::HalfValue(line[x * 2 + 1]);
+
+                if (!std::isfinite(u))
+                    u = 0.0f;
+                if (!std::isfinite(v))
+                    v = 0.0f;
+
+                p->hostMotion[at + 0] = std::clamp(u * p->pixelsPerUvX, -float(w), float(w));
+                p->hostMotion[at + 1] = std::clamp(v * p->pixelsPerUvY, -float(h), float(h));
+            }
+        }
+        motion = &p->hostMotion;
+    }
+
+    const auto tNet = std::chrono::steady_clock::now();
+
+    std::string why;
+    if (!p->network.Run(p->hostColour.data(), motion != nullptr ? motion->data() : nullptr, p->hostResult.data(),
+                        ReprojectHistory(), why))
+    {
+        static std::atomic<unsigned long long> said { 0 };
+        if (said.fetch_add(1, std::memory_order_relaxed) == 0)
+            LOG_WARN("NrBridge: the pass did not run ({}): frames go through", why);
+        return false;
+    }
+
+    p->lastFeaturesMs = p->network.FeaturesMs();
+    p->lastNetMs = p->network.NetMs();
+    p->lastComposeMs = p->network.ComposeMs();
+    p->lastGate = p->network.GateMean();
+    p->network.HeadStats(p->lastHeadMean, p->lastHeadPeak);
+
+    // Back into the game's format, with the exposure put back: the upscaler is handed what
+    // the game would have handed it, scaled the way the game scales it. Written into the
+    // host's own buffer, and taken across in one copy underneath: the same reason as on the
+    // way in.
+    const auto tEncode = std::chrono::steady_clock::now();
+    NrBridge::EncodeColour(p->hostResult.data(), w, h, p->footprint.d3d.Footprint.RowPitch, p->preExposure,
+                           p->rawResult.data());
+
+    const auto tCopyOut = std::chrono::steady_clock::now();
+    std::memcpy(p->stageResult.mapped, p->rawResult.data(), size_t(p->footprint.bytes));
+
+    const auto tEnd = std::chrono::steady_clock::now();
+    p->lastCopyMs = ElapsedMs(tCopyIn, tDecode) + ElapsedMs(tCopyOut, tEnd);
+    p->lastDecodeMs = ElapsedMs(tDecode, tMotion);
+    p->lastMotionMs = ElapsedMs(tMotion, tNet);
+    p->lastEncodeMs = ElapsedMs(tEncode, tEnd);
+    return true;
+}
+
+bool Backend::SlotWrite(VulkanGap::Transfer* transfers, UINT& count)
+{
+    count = 0;
+    if (transfers == nullptr)
+        return false;
+
+    /* The fused path first, and before any question about staging. It was last, behind a
+     * check for the staging buffers that a fused frame deliberately does not have -- the
+     * answer is in the game's own buffer, so there is nothing to stage -- so the check
+     * could not pass, this answered false, and the caller fell through to its passthrough:
+     * a frame the network had just denoised, overwritten with the game's own colour. The
+     * log said it plainly and it was not read: `copies=0 nowork=2008` with `work=69ms`
+     * beside it, which is a network running and its answer being thrown away every frame.
+     * That is the flicker. */
+    if (p->network.Fused())
+        return true;
+
+    if (p->stageResult.buffer == VK_NULL_HANDLE || p->output.buffer == VK_NULL_HANDLE || !p->footprint.valid())
+        return false;
+
+    transfers[count].from = p->stageResult.buffer;
+    transfers[count].to = p->output.buffer;
+    transfers[count].region.srcOffset = 0;
+    transfers[count].region.dstOffset = 0;
+    transfers[count].region.size = p->footprint.bytes;
+    count += 1;
+    return true;
+}
+
+bool Backend::NetworkDevice(DeviceHandles* out)
+{
+    if (out == nullptr)
+        return false;
+    if (!Config::Instance()->NrNetwork.value_or_default())
+        return false;
+    return p->network.Boot(NrFolder(), out);
+}
+
+bool Backend::NetworkUp() const { return p->network.Ready(); }
+const char* Backend::NetworkFailure() const { return p->networkFailure.c_str(); }
+double Backend::LastFeaturesMs() const { return p->lastFeaturesMs; }
+double Backend::LastNetMs() const { return p->lastNetMs; }
+double Backend::LastComposeMs() const { return p->lastComposeMs; }
+double Backend::LastDecodeMs() const { return p->lastDecodeMs; }
+double Backend::LastMotionMs() const { return p->lastMotionMs; }
+double Backend::LastEncodeMs() const { return p->lastEncodeMs; }
+double Backend::LastCopyMs() const { return p->lastCopyMs; }
+float Backend::LastGate() const { return p->lastGate; }
+float Backend::LastHeadMean() const { return p->lastHeadMean; }
+float Backend::LastHeadPeak() const { return p->lastHeadPeak; }
+float Backend::LastLow() const { return p->lastLow; }
+float Backend::LastHigh() const { return p->lastHigh; }
 std::string Backend::Status() const { return "no renderer attached"; }
 bool Backend::IsRunning() const { return false; }
 UINT64 Backend::RecordedFrames() const { return p->recorded.load(std::memory_order_relaxed); }
+
+/* The hook, at the device's own creation, with no queue and nothing else running.
+ *
+ * The reference has this entry for exactly this reason and names it ArmCreate
+ * (`SubmissionHooks.h`, taken as it was written): the create hook needs a device and
+ * nothing else, so it can be in place before a game has made anything at all -- where
+ * `EnsureSubmissionArmed` cannot, because it waits for a queue and a frame.
+ *
+ * The log is what says this game needs it: `declined=1813` against `cutsRecorded=586`,
+ * every decline "(not our list)". Three evaluates in four arrive with a list the proxy
+ * never wrapped, so three frames in four are the game's own colour -- the flicker. The
+ * reference's own note above that switch says who does this: "UE can retain lists created
+ * before the first swapchain."
+ *
+ * Calling it early is harmless if it is too late: ArmCreate answers S_FALSE once armed,
+ * and EnsureSubmissionArmed's own path is unchanged. */
+void ArmSubmissionAtDeviceCreation(ID3D12Device* device)
+{
+    if (device == nullptr)
+        return;
+    if (!Config::Instance()->NrWrapLists.value_or_default())
+        return;
+
+    DlssNr::Submission::Hooks::SetEarlyExeWrap(true);
+    DlssNr::Submission::Hooks::SetProxyWrap(true);
+    DlssNr::Submission::Hooks::SetWrapOpenLists(true);
+    const auto hr = DlssNr::Submission::Hooks::ArmCreate(device);
+    LOG_INFO("NrBridge: the create hook is in place at the device's own creation (0x{:x}), "
+             "so the lists the game makes from here are ours",
+             static_cast<unsigned>(hr));
+}
 
 void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
                            ID3D12CommandQueue* timingQueue)

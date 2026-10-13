@@ -1398,6 +1398,7 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
         LOG_DEBUG("Device captured: {0:X}", (size_t) *ppDevice);
         State::Instance().currentD3D12Device = (ID3D12Device*) *ppDevice;
 
+
         if (szName.size() > 0)
             State::Instance().DeviceAdapterNames[*ppDevice] = wstring_to_string(szName);
 
@@ -1528,6 +1529,7 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
     {
         LOG_DEBUG("Device captured: {0:X}", (size_t) *ppDevice);
         State::Instance().currentD3D12Device = (ID3D12Device*) *ppDevice;
+
 
         if (szName.size() > 0)
             State::Instance().DeviceAdapterNames[*ppDevice] = wstring_to_string(szName);

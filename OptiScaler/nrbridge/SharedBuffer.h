@@ -90,20 +90,12 @@ struct SharedBuffer
     VkDeviceMemory memory = VK_NULL_HANDLE;
     UINT64 size = 0;
 
+    // The D3D12 half, and all the fused path needs: a shared resource and a handle
+    // to it. Nothing here names a Vulkan object, so a frame can have its buffers
+    // before the hand-over has a device -- which it does, because the hand-over
+    // comes up when the slot first runs, later than the first frame is recorded.
     bool Create(ID3D12Device* d3d, UINT64 bytes, std::string& why)
     {
-        auto& vk = VulkanGap::TheBridge();
-
-        // Everything below names Vulkan objects, so it cannot be attempted before there is a
-        // Vulkan device to name them on: the hand-over comes up when the slot first runs, which
-        // is later than the first frame is recorded. A frame whose buffers cannot be made is a
-        // frame passed through, not a frame worth a null handle.
-        if (!vk.ready || vk.device == VK_NULL_HANDLE || vk.memoryHandleProperties == nullptr)
-        {
-            why = "the hand-over is not up yet";
-            return false;
-        }
-
         if (bytes == 0)
         {
             why = "a shared buffer of no bytes";
@@ -145,8 +137,42 @@ struct SharedBuffer
             std::snprintf(text, sizeof text,
                           "the shared buffer's handle was refused: %llu bytes, heap type %d flags 0x%X (query 0x%08lX)",
                           static_cast<unsigned long long>(width), static_cast<int>(got.Type),
-                          static_cast<unsigned>(flags), static_cast<unsigned long>(query));
+                          static_cast<unsigned>(flags), static_cast<unsigned>(query));
             why = text;
+            return false;
+        }
+
+        resource = made;
+        handle = shared;
+        size = width;
+        return true;
+    }
+
+    // The Vulkan half, made only where this side has to read or write the bytes
+    // itself -- that is, where the frame is carried over by copy, as it is when the
+    // network is not fused.
+    //
+    // The fused path must not call this. Mochi's bridge imports once, on the one
+    // device the network runs on (nr_pe_session.cpp: "recorded on our device"), and
+    // the network's own device imports the same handle there; a second import of one
+    // D3D12 resource, from another device, does not agree with the first about what
+    // the memory holds -- the side that imported second reads something stable and
+    // wrong, which is a frame of noise. So the hand-over imports only when the
+    // hand-over is the side carrying the frame.
+    bool Import(std::string& why)
+    {
+        if (buffer != VK_NULL_HANDLE)
+            return true;
+
+        auto& vk = VulkanGap::TheBridge();
+        if (!vk.ready || vk.device == VK_NULL_HANDLE || vk.memoryHandleProperties == nullptr)
+        {
+            why = "the hand-over is not up yet";
+            return false;
+        }
+        if (handle == nullptr)
+        {
+            why = "there is no handle to import";
             return false;
         }
 
@@ -154,13 +180,12 @@ struct SharedBuffer
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
 
         VkBufferCreateInfo bi { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external };
-        bi.size = width;
+        bi.size = size;
         bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
         VkBuffer bufferMade = VK_NULL_HANDLE;
         if (vkCreateBuffer(vk.device, &bi, nullptr, &bufferMade) != VK_SUCCESS)
         {
-            CloseHandle(shared);
             why = "vkCreateBuffer (shared) failed";
             return false;
         }
@@ -169,11 +194,10 @@ struct SharedBuffer
         vkGetBufferMemoryRequirements(vk.device, bufferMade, &req);
 
         VkMemoryWin32HandlePropertiesKHR props { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
-        if (vk.memoryHandleProperties(vk.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, shared, &props) !=
+        if (vk.memoryHandleProperties(vk.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, handle, &props) !=
             VK_SUCCESS)
         {
             vkDestroyBuffer(vk.device, bufferMade, nullptr);
-            CloseHandle(shared);
             why = "the driver would not say what the shared buffer's handle can be imported as";
             return false;
         }
@@ -185,29 +209,25 @@ struct SharedBuffer
 
         VkImportMemoryWin32HandleInfoKHR import { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR, &dedicated };
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
-        import.handle = shared;
+        import.handle = handle;
 
-        const UINT64 allocBytes =
-            std::max<UINT64>(req.size, d3d->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes);
         const uint32_t type =
             VulkanGap::MemoryType(req.memoryTypeBits & props.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (type == std::numeric_limits<uint32_t>::max())
         {
             vkDestroyBuffer(vk.device, bufferMade, nullptr);
-            CloseHandle(shared);
             why = "no device-local memory type this buffer's handle can be imported into";
             return false;
         }
 
         VkMemoryAllocateInfo ai { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import };
-        ai.allocationSize = allocBytes;
+        ai.allocationSize = req.size;
         ai.memoryTypeIndex = type;
 
         VkDeviceMemory memoryMade = VK_NULL_HANDLE;
         if (vkAllocateMemory(vk.device, &ai, nullptr, &memoryMade) != VK_SUCCESS)
         {
             vkDestroyBuffer(vk.device, bufferMade, nullptr);
-            CloseHandle(shared);
             why = "the import of the shared buffer failed";
             return false;
         }
@@ -216,16 +236,12 @@ struct SharedBuffer
         {
             vkFreeMemory(vk.device, memoryMade, nullptr);
             vkDestroyBuffer(vk.device, bufferMade, nullptr);
-            CloseHandle(shared);
             why = "vkBindBufferMemory (shared) failed";
             return false;
         }
 
-        resource = made;
-        handle = shared;
         buffer = bufferMade;
         memory = memoryMade;
-        size = width;
         return true;
     }
 

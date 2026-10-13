@@ -572,6 +572,9 @@ bool Config::Reload(std::filesystem::path iniPath)
             NrEnabled.set_from_config(readBool("DlssNr", "Enabled"));
             NrRunBeforeSR.set_from_config(readBool("DlssNr", "RunBeforeSR"));
             NrWrapLists.set_from_config(readBool("DlssNr", "WrapLists"));
+            NrNetwork.set_from_config(readBool("DlssNr", "Network"));
+            NrMvReproject.set_from_config(readBool("DlssNr", "MvReproject"));
+            NrFolder.set_from_config(readString("DlssNr", "Folder"));
             RestoreComputeSignature.set_from_config(readBool("Hotfix", "RestoreComputeSignature"));
             RestoreGraphicSignature.set_from_config(readBool("Hotfix", "RestoreGraphicSignature"));
             ExtendedStateRestore.set_from_config(readBool("Hotfix", "ExtendedStateRestore"));

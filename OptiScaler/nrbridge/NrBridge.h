@@ -22,6 +22,8 @@
 #include <nvsdk_ngx.h>
 #include <vulkan/vulkan.h>
 
+#include <nrbridge/VulkanGap.h>
+
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -31,6 +33,8 @@ class Config;
 
 namespace NrBridge
 {
+struct DeviceHandles;   // the network's device, as plain numbers (see NrPipeline.h)
+
 inline constexpr unsigned int MaxPassCount = 3;
 
 struct Frame
@@ -134,6 +138,49 @@ class Backend
     // colour was put into, to the buffer the answer comes back in. False while there are no
     // buffers, which is also how the slot knows to submit its handshake alone.
     bool SlotCopy(VkBufferCopy* region, VkBuffer* from, VkBuffer* to);
+
+    // The same place, with the network standing in it. Three calls, because the host's work
+    // is between two submissions and cannot be inside either:
+    //
+    //   SlotRead    the frame's colour and its motion vectors, out of the shared buffers and
+    //               into buffers the host can read. Nothing is signalled by this submission:
+    //               it is not the answer, it is the question.
+    //   SlotWork    after the device has said it finished: the pass itself, on the host, over
+    //               what SlotRead's submission carried.
+    //   SlotWrite   the composed frame, out of the host's buffer and into the buffer the
+    //               continuation half reads back. This one is submitted with the signal.
+    //
+    // False from any of them means the frame goes through as the reference's passthrough
+    // instead, which is the answer the slot already knows how to give.
+    bool SlotRead(VulkanGap::Transfer* transfers, UINT& count);
+    bool SlotWork(UINT64 value);
+    bool SlotWrite(VulkanGap::Transfer* transfers, UINT& count);
+    // Whether the pass has ever come up, and why it has not if it has not.
+    bool NetworkUp() const;
+    // The device the network runs on, for the hand-over to be built on instead of
+    // beside it. False where the network is off or cannot give one.
+    bool NetworkDevice(DeviceHandles* out);
+    const char* NetworkFailure() const;
+    // What the last frame cost in each of its three parts, what the gate made of the
+    // history, and a look at the head and at the colour it was handed. Diagnostics: the
+    // pass does not read them.
+    double LastFeaturesMs() const;
+    double LastNetMs() const;
+    double LastComposeMs() const;
+    // The same frame's three host-side parts: the colour out of the game's format, the
+    // vectors out of theirs, and the answer back into the game's. Kept apart from the
+    // network's own three because they are the host's work on the CPU, and a frame that is
+    // slow here is slow in a different place from one that is slow on the device.
+    double LastDecodeMs() const;
+    double LastMotionMs() const;
+    double LastEncodeMs() const;
+    // What taking the frame across and back in one copy each cost.
+    double LastCopyMs() const;
+    float LastGate() const;
+    float LastHeadMean() const;
+    float LastHeadPeak() const;
+    float LastLow() const;
+    float LastHigh() const;
     std::string Status() const;
     bool IsRunning() const;
     UINT64 RecordedFrames() const;
@@ -145,6 +192,11 @@ class Backend
 // timingQueue is the queue this command list will be executed on, when the caller knows it --
 // State::currentCommandQueue only exists once a D3D12 swapchain has been created, so without
 // it the pass runs and never reports what it cost.
+// Arm the create hook with nothing but the device, at its creation. Safe to call more
+// than once and safe to call after the queue path has armed it: the reference's own
+// ArmCreate answers S_FALSE when it is already armed, and the other path is unchanged.
+void ArmSubmissionAtDeviceCreation(ID3D12Device* device);
+
 void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
                            ID3D12CommandQueue* timingQueue = nullptr);
 
