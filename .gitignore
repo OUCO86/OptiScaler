@@ -444,3 +444,5 @@ CyberFSR/imgui.ini
 # Build output
 /build_x64/
 /logs/
+
+_cmsg.txt
