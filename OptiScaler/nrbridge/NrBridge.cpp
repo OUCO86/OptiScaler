@@ -8,6 +8,7 @@
 #include "Util.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -267,10 +268,10 @@ void EnsureSubmissionArmed(ID3D12Device* device, ID3D12CommandQueue* queue)
      * on the swapchain's queue; lists created before it are still the game's own and no
      * later switch reaches them.
      *
-     * Turned on before `Arm` so that the boot-time creations are seen, and limited to the
-     * host executable, which is the reference's own limit -- wrapping Streamline's or a
-     * vendor module's lists is what the comment rules out. */
-    DlssNr::Submission::Hooks::SetEarlyExeWrap(true);
+     * The boot lists that were already made are still the game's own: that is what
+     * `ArmSubmissionAtDeviceCreation` exists for, and it ran before this frame. What is
+     * missing here is only the game's own queue, so this switch is not touched -- the
+     * reference decides early wrapping once, at the device, against its whitelist. */
     DlssNr::Submission::Hooks::SetProxyWrap(true);
     DlssNr::Submission::Hooks::SetWrapOpenLists(true);
     const auto hr = DlssNr::Submission::Hooks::Arm(device, queue);
@@ -2077,13 +2078,62 @@ void ArmSubmissionAtDeviceCreation(ID3D12Device* device)
     if (!Config::Instance()->NrWrapLists.value_or_default())
         return;
 
-    DlssNr::Submission::Hooks::SetEarlyExeWrap(true);
-    DlssNr::Submission::Hooks::SetProxyWrap(true);
+    /* Order here is the reference's, and each line is a rule it states beside the code
+     * (`ta_D3D12_Hooks.cpp`, the block after `ArmCreate`):
+     *
+     *   SetWrapOpenLists(...)  open-list proxy is on in the product path.
+     *   ArmCreate(device)      Create* detours only, at the device's own creation.
+     *   ProxyWrap stays OFF    "wrapping every DIRECT list during Streamline/device boot
+     *                           crashes yysls" -- it is the swapchain's job.
+     *   allowEarly             whitelist: Unreal/Forza host calls only; other engines
+     *                           crash with early ArmCreate + wrap.
+     *   earlyQueue + ready     the gate. Early wrapping is on only if the queue detour
+     *                           was installed, because the between slot needs it.
+     *
+     * The earlier attempt turned ProxyWrap and WrapOpenLists on here as well; that is the
+     * line the reference names as the crash, and it lost the device at
+     * `SwapChain1->ResizeBuffers`. */
+    DlssNr::Submission::Hooks::SetProxyWrap(false);
     DlssNr::Submission::Hooks::SetWrapOpenLists(true);
     const auto hr = DlssNr::Submission::Hooks::ArmCreate(device);
-    LOG_INFO("NrBridge: the create hook is in place at the device's own creation (0x{:x}), "
-             "so the lists the game makes from here are ours",
-             static_cast<unsigned>(hr));
+    if (FAILED(hr))
+    {
+        LOG_INFO("NrBridge: create hook not installed at device creation (0x{:x})", static_cast<unsigned>(hr));
+        return;
+    }
+    LOG_INFO("NrBridge: the create hook is in place at the device's own creation, so the lists the game "
+             "makes from here are ours; ProxyWrap stays off until the swapchain");
+
+    const auto& st = State::Instance();
+    std::string exeLower = st.GameExe;
+    for (char& c : exeLower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const bool isUnreal = st.GameEngine == GameEngineType::Unreal;
+    // LOP-Win64-Shipping.exe: the reference's whitelist is engine-based, and the engine
+    // here is only half detected at this point (the version-info check runs later), so
+    // the shipping-exe shape it also accepts is accepted too.
+    const bool isUnrealShape = exeLower.ends_with("-win64-shipping.exe") || exeLower.ends_with("-wingdk-shipping.exe") ||
+                               exeLower.ends_with("-windows-shipping.exe");
+    const bool allowEarly = isUnreal || isUnrealShape;
+    LOG_INFO("NrBridge: early exe wrap allow={} (unreal={} shape={})", allowEarly, isUnreal, isUnrealShape);
+
+    if (!allowEarly)
+    {
+        DlssNr::Submission::Hooks::SetEarlyExeWrap(false);
+        return;
+    }
+
+    // The gate, asked on a temporary queue exactly as the reference asks it: no game
+    // queue exists yet this early, and a DIRECT queue is all the detour needs.
+    D3D12_COMMAND_QUEUE_DESC queueDesc {};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* earlyQueue = nullptr;
+    const bool created = SUCCEEDED(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&earlyQueue)));
+    const bool ready = created && DlssNr::Submission::Hooks::EnsureExecuteHook(earlyQueue);
+    if (earlyQueue != nullptr)
+        earlyQueue->Release();
+    DlssNr::Submission::Hooks::SetEarlyExeWrap(allowEarly && ready);
+    LOG_INFO("NrBridge: early executable proxy: {} (submission hook ready={})", allowEarly && ready, ready);
 }
 
 void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,

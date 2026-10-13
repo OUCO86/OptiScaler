@@ -8,6 +8,8 @@
 
 #include <resource_tracking/ResTrack_Dx12.h>
 
+#include <nrbridge/NrBridge.h>
+
 #include <proxies/D3D12_Proxy.h>
 #include <proxies/XeFG_Proxy.h>
 #include <proxies/XeSS_Proxy.h>
@@ -1419,6 +1421,26 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
 
         HookToDevice(State::Instance().currentD3D12Device);
         _d3d12Captured = true;
+
+        /* Arm the NR submission hook on CreateCommandList here, at the device's own creation,
+         * rather than at the swapchain. This game's lists are made and then reused, and the
+         * swapchain path arrives after them: the log showed eval=1600 with proxyHits=0 and
+         * declined=1599, i.e. the cut ran every frame and matched a list of ours none times.
+         * The reference names exactly this in `ta_docs_mochizuki.md:148`: "This addresses
+         * retained boot lists missing NR".
+         *
+         * Every captured device gets it, exactly as HookToDevice above is called per device and
+         * not once: OptiScaler keeps the last one as currentD3D12Device without comparing
+         * (`D3D12_Hooks.cpp:1399`), so it does not itself decide which adapter is the renderer.
+         * ArmCreate is idempotent (the reference's own returns S_FALSE once armed), so a second
+         * device, or the queue path arriving later, costs one atomic load.
+         *
+         * Measured, Lies of P, A770 960x540: before this, notOurs=2263 with proxyHits=0;
+         * after it, eval=1200 proxyHits=1199 cutsRecorded=1199 declined=0 and all four decline
+         * counters zero. See ArmSubmissionAtDeviceCreation for the order this has to keep --
+         * ProxyWrap stays off until the swapchain, and early wrapping is gated on the queue
+         * detour being installed. */
+        NrBridge::ArmSubmissionAtDeviceCreation(State::Instance().currentD3D12Device);
 
         State::Instance().d3d12Devices.push_back((ID3D12Device*) *ppDevice);
 

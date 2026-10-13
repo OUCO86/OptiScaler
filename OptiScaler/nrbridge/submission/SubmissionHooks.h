@@ -26,6 +26,11 @@ struct BetweenState
 
 inline std::mutex g_mu;
 inline std::atomic<bool> g_armed { false };
+// The reference keeps these as two separate subsystems with two separate flags:
+// `ArmCreate` installs the Create* detours only, `AmdBridge::EnsureSubmissionHook`
+// installs the queue Execute detour only, and either can be ready while the other is
+// not. One shared flag makes the second installer a no-op, which is why this exists.
+inline std::atomic<bool> g_executeArmed { false };
 inline std::atomic<bool> g_expandEnabled { false };
 // Product: ProxyWrap starts OFF; swapchain ctor enables it (Streamline-safe). Harness: SetProxyWrap(true) after Arm.
 // Harnesses can SetProxyWrap(true) after Arm.
@@ -262,13 +267,63 @@ inline void WINAPI hkExecuteCommandLists(ID3D12CommandQueue *queue, UINT num, ID
     ExecuteExpanded(queue, num, lists, between.fn, between.ctx, o_ExecuteCommandLists);
 }
 
+/* Execute-only installer -- the local stand-in for the reference's
+ * `AmdBridge::EnsureSubmissionHook(queue)`, which the reference also treats as a
+ * subsystem of its own: `ArmCreate` installs Create* and returns, and the queue detour
+ * is a separate question asked separately, answered by its own `submissionHookReady`.
+ * Merging the two is what made the earlier attempt a no-op after ArmCreate had run.
+ * Callers must hold g_mu. */
+inline bool EnsureExecuteHookLocked(ID3D12CommandQueue *queue)
+{
+    if (!queue)
+        return false;
+    if (g_executeArmed.load(std::memory_order_relaxed))
+        return true;
+    void **queueVt = *reinterpret_cast<void ***>(queue);
+    // ID3D12CommandQueue::ExecuteCommandLists is vtable slot 10.
+    o_ExecuteCommandLists = reinterpret_cast<PFN_ExecuteCommandLists>(queueVt[10]);
+    if (!o_ExecuteCommandLists)
+        return false;
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    DetourAttach(reinterpret_cast<PVOID *>(&o_ExecuteCommandLists), hkExecuteCommandLists);
+    const LONG err = DetourTransactionCommit();
+    if (err != NO_ERROR)
+    {
+        o_ExecuteCommandLists = nullptr;
+        return false;
+    }
+    NoteRawExecuteCommandLists(o_ExecuteCommandLists);
+    g_executeArmed.store(true, std::memory_order_release);
+    return true;
+}
+
+// The reference's ready gate: no queue of the game's own is needed to ask this, and
+// asking it on a temporary queue is what it does (`ta_D3D12_Hooks.cpp`, the block after
+// `ArmCreate`: create a DIRECT queue, ask, release it). Returns the same boolean the
+// reference stores as `ready`.
+inline bool EnsureExecuteHook(ID3D12CommandQueue *queue)
+{
+    if (!queue)
+        return false;
+    std::lock_guard<std::mutex> lock(g_mu);
+    return EnsureExecuteHookLocked(queue);
+}
+
 inline HRESULT Arm(ID3D12Device *device, ID3D12CommandQueue *queue)
 {
     if (!device || !queue)
         return E_INVALIDARG;
     std::lock_guard<std::mutex> lock(g_mu);
     if (g_armed.load(std::memory_order_relaxed))
-        return S_FALSE;
+    {
+        // ArmCreate already owns the Create* detours (the product path arms them at the
+        // device's own creation). Only the queue side is still missing, so this installs
+        // that and leaves the Create* originals -- and the transaction that owns them --
+        // exactly as ArmCreate left them.
+        g_expandEnabled.store(true, std::memory_order_release);
+        return EnsureExecuteHookLocked(queue) ? S_OK : S_FALSE;
+    }
 
     void **devVt = *reinterpret_cast<void ***>(device);
     void **queueVt = *reinterpret_cast<void ***>(queue);
@@ -303,6 +358,7 @@ inline HRESULT Arm(ID3D12Device *device, ID3D12CommandQueue *queue)
         return HRESULT_FROM_WIN32(err);
     }
     NoteRawExecuteCommandLists(o_ExecuteCommandLists);
+    g_executeArmed.store(true, std::memory_order_release);
     g_armed.store(true, std::memory_order_release);
     g_expandEnabled.store(true, std::memory_order_release);
     return S_OK;
@@ -369,6 +425,7 @@ inline void Disarm()
     o_CreateCommandList = nullptr;
     o_CreateCommandList1 = nullptr;
     o_ExecuteCommandLists = nullptr;
+    g_executeArmed.store(false, std::memory_order_release);
     g_between = nullptr;
     g_betweenCtx = nullptr;
     g_armed.store(false, std::memory_order_release);
