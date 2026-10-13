@@ -380,6 +380,12 @@ class Config
     // slot doing what it has always done -- the frame's own colour, copied -- which is the
     // one change that separates a crash in the network from a crash in the hand-over.
     CustomOptional<bool> NrNetwork { true };
+    // Whether the model's edit is applied to the picture. Off is not "NR off": the
+    // network still runs and costs the same, and only its answer stops being blended in,
+    // so the frame shown is exactly the upscaler's own. That is what makes it useful to
+    // compare against -- see `Pipeline::ApplyModel`, and the reference's own note that
+    // turning this off "shows the clean upscaler frame while the pass keeps running".
+    CustomOptional<bool> NrApplyModel { true };
     // Move the history by the frame's motion vectors before the network sees it. Off is the
     // identity reprojection the layer has always used: right where the scene stood still,
     // wrong where it moved, and the thing this host exists to replace.

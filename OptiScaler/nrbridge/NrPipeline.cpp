@@ -344,6 +344,7 @@ bool Pipeline::LoadLibraries(const std::filesystem::path& folder, std::string& w
     netWait = reinterpret_cast<NrNetWait>(GetProcAddress(net_, "nr_net_wait"));
     netFused = reinterpret_cast<NrNetFused>(GetProcAddress(net_, "nr_net_fused"));
     netExposure = reinterpret_cast<NrNetExposure>(GetProcAddress(net_, "nr_net_exposure"));
+    netIntensity = reinterpret_cast<NrNetIntensity>(GetProcAddress(net_, "nr_net_intensity"));
     netProfile = reinterpret_cast<NrNetProfile>(GetProcAddress(net_, "nr_net_profile"));
     netBoot = reinterpret_cast<NrNetBoot>(GetProcAddress(net_, "nr_net_boot"));
     netInstance = reinterpret_cast<NrNetHandle>(GetProcAddress(net_, "nr_net_instance"));
@@ -417,6 +418,17 @@ void Pipeline::Exposure(float value, bool fresh)
     if (!(value > 0.0f) || !std::isfinite(value))
         return;   // the passes then read the one the fused open put there
     netExposure(net, value, fresh ? 1 : 0);
+}
+
+// Whether the model's edit is applied. Zero, not a branch: `nr_post.comp` computes
+// `rgb + blend * (predicted - rgb)`, so a blend of zero returns the frame's own colour
+// exactly while the graph still runs -- which is what makes this a fair A/B rather
+// than two different frames.
+void Pipeline::ApplyModel(bool on)
+{
+    if (netIntensity == nullptr || net == nullptr)
+        return;
+    netIntensity(net, on ? 1.0f : 0.0f);
 }
 
 bool Pipeline::Prepare(UINT width, UINT height, const std::filesystem::path& folder, std::string& why)

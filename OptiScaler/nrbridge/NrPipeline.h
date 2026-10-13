@@ -58,6 +58,10 @@ extern "C"
                               const void* plan, unsigned long long planBytes, const float* table);
     typedef int (*NrNetWait)(nr_net*, unsigned long long handle, unsigned long long value);
     typedef int (*NrNetExposure)(nr_net*, float, int fresh);
+    // The reference's `apply_model`: whether the model's edit is applied, as the number
+    // the composition blends by. Zero is the frame's own colour exactly, and the network
+    // runs either way -- so it is an A/B of one frame, not of two.
+    typedef int (*NrNetIntensity)(nr_net*, float);
     typedef int (*NrNetProfile)(nr_net*, int on);
     // Whether the recording really carries the two fused passes. nr_net_fuse is the
     // request and this is the answer: the walk decides while it runs, so a fuse that was
@@ -165,6 +169,19 @@ class Pipeline
     // The game moves it between frames, so it cannot be given once at the open.
     void Exposure(float value, bool fresh);
 
+    // The reference's `apply_model`: whether the model's edit is applied, as the number
+    // the composition blends by. Zero is the frame's own colour exactly, and the network
+    // runs either way -- which is the point of it. `ta_DlssNr_Menu.cpp` is explicit that
+    // turning it off "shows the clean upscaler frame while the pass keeps running", so a
+    // frozen frame can be toggled and compared with the same cost on both sides; an NR
+    // that stopped would compare two different frames at two different frame times, and
+    // the picture would say nothing about what the network contributed.
+    //
+    // Put into the frame's own table rather than around the run, so the network keeps
+    // running and only the blend moves. Cheap enough to ask for every frame: one
+    // host-visible float, no synchronisation.
+    void ApplyModel(bool on);
+
     // What is in the answer: mean, lowest, highest. A diagnostic, and the only one that
     // can tell a network which is running and answering from one which is running and
     // answering with noise, since a fused frame never comes back to the host.
@@ -226,6 +243,7 @@ class Pipeline
     NrNetWait netWait = nullptr;
     NrNetFused netFused = nullptr;
     NrNetExposure netExposure = nullptr;
+    NrNetIntensity netIntensity = nullptr;
     NrNetProfile netProfile = nullptr;
     NrNetBoot netBoot = nullptr;
     NrNetHandle netInstance = nullptr, netPhysical = nullptr, netDevice = nullptr, netQueue = nullptr;

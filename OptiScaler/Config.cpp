@@ -573,6 +573,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             NrRunBeforeSR.set_from_config(readBool("DlssNr", "RunBeforeSR"));
             NrWrapLists.set_from_config(readBool("DlssNr", "WrapLists"));
             NrNetwork.set_from_config(readBool("DlssNr", "Network"));
+            NrApplyModel.set_from_config(readBool("DlssNr", "ApplyModel"));
             NrMvReproject.set_from_config(readBool("DlssNr", "MvReproject"));
             NrFolder.set_from_config(readString("DlssNr", "Folder"));
             RestoreComputeSignature.set_from_config(readBool("Hotfix", "RestoreComputeSignature"));
@@ -1226,6 +1227,11 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->NrRunBeforeSR.value_for_config()).c_str());
         ini.SetValue("DlssNr", "WrapLists",
                      GetBoolValue(Instance()->NrWrapLists.value_for_config()).c_str());
+        // The A/B switch, and the one NR setting a user changes on purpose, so it is kept.
+        // Network and MvReproject are read but never written: they are diagnostics, and a
+        // file that remembered them would carry a fault into the next run unnoticed.
+        ini.SetValue("DlssNr", "ApplyModel",
+                     GetBoolValue(Instance()->NrApplyModel.value_for_config()).c_str());
         ini.SetValue("Hotfix", "RestoreComputeSignature",
                      GetBoolValue(Instance()->RestoreComputeSignature.value_for_config()).c_str());
         ini.SetValue("Hotfix", "RestoreGraphicSignature",

@@ -4555,6 +4555,76 @@ bool MenuCommon::RenderMenu()
                     }
                 }
 
+                /* Neural Rendering, its own section. The reference gives this a page of its
+                 * own ("the NR settings are on the DLSS Neural Rendering page",
+                 * `src/windows/package/README.txt`) rather than folding it into the upscaler,
+                 * because it is not an upscaler: the network runs on a Vulkan device beside
+                 * the game's and the frame crosses between the two. */
+                if (state.api == DX12 || state.api == DX11)
+                {
+                    SeparatorWithHelpMarker(
+                        "Neural Rendering",
+                        "DLSS 5 neural rendering, run on a Vulkan device beside the game's.\n\n"
+                        "Nothing here applies until this is on. With NR on and the model "
+                        "applied, the game's own upscaler does the frame and the network's "
+                        "correction is blended over it.");
+
+                    bool nrEnabled = config->NrEnabled.value_or_default();
+                    if (ImGui::Checkbox("Enable Neural Rendering", &nrEnabled))
+                    {
+                        config->NrEnabled = nrEnabled;
+                        LOG_INFO("Menu: NrEnabled set to {}", nrEnabled);
+                    }
+
+                    ImGui::BeginDisabled(!config->NrEnabled.value_or_default());
+
+                    /* The reference's `apply_model`, and the reason it is not simply "NR off":
+                     * the network keeps running and keeps costing what it costs, and only its
+                     * answer stops being blended in, so the frame on screen is exactly the
+                     * upscaler's own. That makes it an A/B of one frame against another
+                     * rather than of two frames -- `ta_DlssNr_Menu.cpp` says the same thing
+                     * of its own switch: "Off shows the clean upscaler frame while the pass
+                     * keeps running". */
+                    bool applyModel = config->NrApplyModel.value_or_default();
+                    if (ImGui::Checkbox("Apply the model", &applyModel))
+                    {
+                        config->NrApplyModel = applyModel;
+                        LOG_INFO("Menu: NrApplyModel set to {}", applyModel);
+                    }
+                    ShowHelpMarker("Whether the model's edit is applied.\n\n"
+                                   "Off does not stop the network: it runs and costs the same, "
+                                   "and the picture shown is the upscaler's own, unedited. "
+                                   "That is what makes it comparable -- both sides show the "
+                                   "same frame at the same cost.\n\n"
+                                   "To save the work, turn Neural Rendering off instead.");
+
+                    bool nrNetwork = config->NrNetwork.value_or_default();
+                    if (ImGui::Checkbox("Run the network", &nrNetwork))
+                    {
+                        config->NrNetwork = nrNetwork;
+                        LOG_INFO("Menu: NrNetwork set to {}", nrNetwork);
+                    }
+                    ShowHelpMarker("Run the network in the slot between the two halves of the "
+                                   "frame, rather than passing the frame through.\n\n"
+                                   "Off leaves the slot copying the frame's own colour, which "
+                                   "is what separates a fault in the network from a fault in "
+                                   "the hand-over. Diagnostic; leave it on for normal use.");
+
+                    bool nrMv = config->NrMvReproject.value_or_default();
+                    if (ImGui::Checkbox("Reproject history by motion vectors", &nrMv))
+                    {
+                        config->NrMvReproject = nrMv;
+                        LOG_INFO("Menu: NrMvReproject set to {}", nrMv);
+                    }
+                    ShowHelpMarker("Move the previous frame's output by this frame's motion "
+                                   "vectors before the network reads it.\n\n"
+                                   "Off is the identity: right where the scene stood still, "
+                                   "wrong where it moved. Not for ordinary play -- it is here "
+                                   "to tell a reprojection fault from anything else.");
+
+                    ImGui::EndDisabled();
+                }
+
                 // OptiFG
                 if (state.api == DX12 && state.currentFGSwapchain != nullptr &&
                     state.workingMode != WorkingMode::Nvngx && state.activeFgInput == FGInput::Upscaler)

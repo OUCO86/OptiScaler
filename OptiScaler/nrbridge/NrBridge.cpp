@@ -1886,6 +1886,12 @@ bool Backend::SlotWork(UINT64 value)
         // frame the game has moved away from since.
         p->network.Exposure(p->preExposure, p->freshHistory);
 
+        // Whether the edit is blended in, asked every frame so that flipping it in the
+        // menu takes effect on the next one without anything being rebuilt. Zero is the
+        // frame's own colour exactly and the graph still runs, which is the whole point:
+        // both sides of the comparison cost the same and show the same frame.
+        p->network.ApplyModel(Config::Instance()->NrApplyModel.value_or_default());
+
 
         p->freshHistory = false;   // every frame after this one has the last one behind it
 
