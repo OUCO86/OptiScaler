@@ -941,9 +941,6 @@ struct Backend::Impl
     float pixelsPerUvX = 0, pixelsPerUvY = 0;
     float preExposure = 1;
     bool freshHistory = true;
-    int probeTick = 0;
-    int passTick = 0;
-    bool profiling = false;
     bool haveMotion = false;
 
     // What the pass cost, and what it answered, for the log.
@@ -1571,50 +1568,7 @@ bool Backend::SlotWork(UINT64 value)
         // frame the game has moved away from since.
         p->network.Exposure(p->preExposure, p->freshHistory);
 
-        /* Where the frame's time goes, in three parts: the CPU handing the work over,
-         * the CPU waiting for it, and the read-back. The pass timing that used to stand
-         * here is off now -- it writes 417 timestamps a frame and reads them back with
-         * WAIT, which blocks the CPU behind the device and shows up as input lag.
-         *
-         * It answered its question, though: 62ms a frame with nothing over 2.6ms in any of
-         * the 417, which is a frame slow somewhere the device's own clock cannot see. */
-        if (!p->profiling)
-        {
-            p->profiling = true;
-            p->network.StartSubmitTiming();
-        }
 
-        /* Every thirtieth frame, since that is ten of the slow ones at this cycle length
-         * and one report cannot then have missed one. */
-        if (p->passTick >= 30)
-        {
-            p->passTick = 0;
-            p->network.LogSubmitTiming();
-        }
-        else
-        {
-            p->passTick += 1;
-        }
-
-        // What came back, every thirtieth frame: the one number that says whether the
-        // network is answering with a picture or with noise. It costs a megabyte read
-        // that never reaches the frame, which is why it is not every frame.
-        if (++p->probeTick >= 30)
-        {
-            p->probeTick = 0;
-            float inMean = 0.0f, inLow = 0.0f, inHigh = 0.0f;
-            float outMean = 0.0f, outLow = 0.0f, outHigh = 0.0f;
-            // The colour that went in beside the answer that came out: two halves of one
-            // question, and a number that does not move while the camera does says the
-            // half on the left never held the frame.
-            const bool a = p->network.Probe(0, &inMean, &inLow, &inHigh);
-            const bool b = p->network.Probe(1, &outMean, &outLow, &outHigh);
-            float channels[48] = {};
-            p->network.ProbeFeatures(channels);
-            if (a && b)
-                LOG_INFO("NrBridge: in mean {:.4f} low {:.4f} high {:.4f} | out mean {:.4f} low {:.4f} high {:.4f} | exposure {:.3f}",
-                         inMean, inLow, inHigh, outMean, outLow, outHigh, p->preExposure);
-        }
         p->freshHistory = false;   // every frame after this one has the last one behind it
 
         const HANDLE fence = VulkanGap::TheBridge().toVkShared;

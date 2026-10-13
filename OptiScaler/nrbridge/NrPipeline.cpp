@@ -345,12 +345,6 @@ bool Pipeline::LoadLibraries(const std::filesystem::path& folder, std::string& w
     netFused = reinterpret_cast<NrNetFused>(GetProcAddress(net_, "nr_net_fused"));
     netExposure = reinterpret_cast<NrNetExposure>(GetProcAddress(net_, "nr_net_exposure"));
     netProfile = reinterpret_cast<NrNetProfile>(GetProcAddress(net_, "nr_net_profile"));
-    netProfileEach = reinterpret_cast<NrNetProfileEach>(GetProcAddress(net_, "nr_net_profile_each"));
-    netProfileReset = reinterpret_cast<NrNetProfileReset>(GetProcAddress(net_, "nr_net_profile_reset"));
-    netTimeSubmit = reinterpret_cast<NrNetTimeSubmit>(GetProcAddress(net_, "nr_net_time_submit"));
-    netTimeReport = reinterpret_cast<NrNetTimeReport>(GetProcAddress(net_, "nr_net_time_report"));
-    netProbe = reinterpret_cast<NrNetProbe>(GetProcAddress(net_, "nr_net_probe"));
-    netProbeFeatures = reinterpret_cast<NrNetProbeFeatures>(GetProcAddress(net_, "nr_net_probe_features"));
     netBoot = reinterpret_cast<NrNetBoot>(GetProcAddress(net_, "nr_net_boot"));
     netInstance = reinterpret_cast<NrNetHandle>(GetProcAddress(net_, "nr_net_instance"));
     netPhysical = reinterpret_cast<NrNetHandle>(GetProcAddress(net_, "nr_net_physical"));
@@ -415,97 +409,6 @@ bool Pipeline::Boot(const std::filesystem::path& folder, DeviceHandles* out)
     return out->device != 0ull && out->queue != 0ull;
 }
 
-void Pipeline::ProbeFeatures(float* channels)
-{
-    if (netProbeFeatures == nullptr || net == nullptr || channels == nullptr)
-        return;
-    netProbeFeatures(net, channels);
-}
-
-bool Pipeline::Probe(int which, float* mean, float* low, float* high)
-{
-    if (netProbe == nullptr || net == nullptr || mean == nullptr || low == nullptr || high == nullptr)
-        return false;
-    float stats[3] = { 0.0f, 0.0f, 0.0f };
-    if (netProbe(net, which, stats) != 0)
-        return false;
-    *mean = stats[0];
-    *low = stats[1];
-    *high = stats[2];
-    return true;
-}
-
-void Pipeline::StartProfiling()
-{
-    LOG_INFO("NrBridge: asking the network to time its passes (have the call: {})",
-             netProfile != nullptr);
-    if (netProfile == nullptr || net == nullptr)
-        return;
-    // Asked once, at the first frame, and a refusal is not fatal: the network runs the same
-    // either way, it just cannot say which of its passes was slow.
-    netProfile(net, 1);
-}
-
-void Pipeline::StartSubmitTiming()
-{
-    if (netTimeSubmit == nullptr || net == nullptr)
-        return;
-    /* The pass timing is turned off as this is turned on, and not because the two cannot
-     * both run: it costs 417 timestamp writes and a `vkGetQueryPoolResults` with WAIT per
-     * frame, and that read-back blocks the CPU until the device is past the last query --
-     * which the player sees as input lag. The submit's own cost is three clock reads. */
-    if (netProfile != nullptr && net != nullptr)
-        netProfile(net, 0);
-    netTimeSubmit(net, 1);
-}
-
-void Pipeline::LogSubmitTiming()
-{
-    if (netTimeReport == nullptr || net == nullptr)
-        return;
-    double v[8] = {};
-    const int frames = netTimeReport(net, v, 8);
-    if (frames <= 0)
-        return;
-    const double n = static_cast<double>(frames);
-    LOG_INFO("NrBridge submit: {} frames | submit {:.2f}ms total, {:.2f}ms max | "
-             "wait {:.2f}ms total, {:.2f}ms max | collect {:.2f}ms total, {:.2f}ms max | "
-             "mean {:.2f}ms",
-             frames, v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
-}
-
-void Pipeline::LogSlowestPasses(int top)
-{
-    if (netProfileEach == nullptr || netProfileReset == nullptr || net == nullptr || top <= 0)
-        return;
-
-    // Every pass since the last look, 417 of them in a normal frame and more when several
-    // have gone by. Kept on the stack in one allocation: the sizes are known here and the
-    // network's own limit is far higher.
-    enum { Cap = 4096 };
-    std::vector<std::pair<double, unsigned>> passes;
-    passes.reserve(Cap);
-    unsigned kinds[Cap] {};
-    double ms[Cap] {};
-    const unsigned got = netProfileEach(net, kinds, ms, Cap);
-    for (unsigned i = 0; i < got; i++)
-        passes.emplace_back(ms[i], (kinds[i] << 16) | i);
-
-    std::sort(passes.rbegin(), passes.rend());
-    double total = 0.0;
-    for (const auto& p : passes) total += p.first;
-
-    LOG_INFO("NrBridge passes: {} timed, {:.2f}ms in total | slowest:", got, total);
-    const unsigned take = static_cast<unsigned>(top) < passes.size() ? static_cast<unsigned>(top)
-                                                                     : passes.size();
-    for (unsigned i = 0; i < take; i++) {
-        const unsigned kind = passes[i].second >> 16;
-        const unsigned at = passes[i].second & 0xFFFFu;
-        LOG_INFO("NrBridge pass #{}: family {} took {:.3f}ms", at, kind, passes[i].first);
-    }
-
-    netProfileReset(net);
-}
 
 void Pipeline::Exposure(float value, bool fresh)
 {

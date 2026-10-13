@@ -59,12 +59,6 @@ extern "C"
     typedef int (*NrNetWait)(nr_net*, unsigned long long handle, unsigned long long value);
     typedef int (*NrNetExposure)(nr_net*, float, int fresh);
     typedef int (*NrNetProfile)(nr_net*, int on);
-    typedef unsigned (*NrNetProfileEach)(nr_net*, unsigned* kinds, double* ms, unsigned cap);
-    typedef void (*NrNetProfileReset)(nr_net*);
-    typedef int (*NrNetTimeSubmit)(nr_net*, int on);
-    typedef int (*NrNetTimeReport)(nr_net*, double* out, unsigned cap);
-    typedef int (*NrNetProbe)(nr_net*, int which, float* out);
-    typedef int (*NrNetProbeFeatures)(nr_net*, float* out);
     // Whether the recording really carries the two fused passes. nr_net_fuse is the
     // request and this is the answer: the walk decides while it runs, so a fuse that was
     // asked for is not necessarily a network that was fused.
@@ -122,18 +116,6 @@ class Pipeline
     bool Prepare(UINT width, UINT height, const std::filesystem::path& folder, std::string& why);
     bool Ready() const { return ready_; }
 
-    // The network's per-pass GPU timing, which libxmx already keeps. One frame in three
-    // costs 108ms against 62ms for the others and the totals cannot say why; this can.
-    void StartProfiling();
-    // The submit's three costs, and their report. These replace the pass timing: a frame
-    // that is slow in `vkQueueSubmit` has every pass looking quick, which is what the
-    // totals showed, and the pass timing itself is not free -- 417 timestamp writes and a
-    // waiting read-back per frame, which the player feels as input lag.
-    void StartSubmitTiming();
-    void LogSubmitTiming();
-    // The slowest passes since the last reset, sorted into `log`. `top` of them.
-    void LogSlowestPasses(int top);
-
     // Bring the device up on its own and hand it over, so the hand-over can be built
     // on it instead of beside it. False where the network is off or the library is an
     // older one without the call; the caller then builds a device of its own, which
@@ -186,10 +168,6 @@ class Pipeline
     // What is in the answer: mean, lowest, highest. A diagnostic, and the only one that
     // can tell a network which is running and answering from one which is running and
     // answering with noise, since a fused frame never comes back to the host.
-    bool Probe(int which, float* mean, float* low, float* high);
-    // The network's own input, 16 channels x (mean, low, high) into 48 floats. Diagnostic.
-    void ProbeFeatures(float* channels);
-
     // One frame on the fused path: the graph waits for the game's fence on the device,
     // runs, and writes the answer straight into the game's own buffer. Nothing is copied
     // in and nothing is read back, so there is no stage to time but the graph's.
@@ -240,12 +218,6 @@ class Pipeline
     NrNetFused netFused = nullptr;
     NrNetExposure netExposure = nullptr;
     NrNetProfile netProfile = nullptr;
-    NrNetProfileEach netProfileEach = nullptr;
-    NrNetProfileReset netProfileReset = nullptr;
-    NrNetTimeSubmit netTimeSubmit = nullptr;
-    NrNetTimeReport netTimeReport = nullptr;
-    NrNetProbe netProbe = nullptr;
-    NrNetProbeFeatures netProbeFeatures = nullptr;
     NrNetBoot netBoot = nullptr;
     NrNetHandle netInstance = nullptr, netPhysical = nullptr, netDevice = nullptr, netQueue = nullptr;
     NrNetFamily netFamily = nullptr;
