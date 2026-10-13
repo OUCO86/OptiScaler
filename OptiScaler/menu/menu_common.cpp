@@ -4575,6 +4575,18 @@ bool MenuCommon::RenderMenu()
                         config->NrEnabled = nrEnabled;
                         LOG_INFO("Menu: NrEnabled set to {}", nrEnabled);
                     }
+                    ShowHelpMarker("Turns the whole path on and off. Off takes effect at once: "
+                                   "the network is not built and does not run at all, which is "
+                                   "the only one of these switches that saves the work.\n\n"
+                                   "Turning it back on is immediate too -- the model stays "
+                                   "loaded, so there is no rebuild to wait for.\n\n"
+                                   "The two together make three steps worth comparing:\n"
+                                   "  off            the game's own picture, and the fastest\n"
+                                   "  on, edit off   the network runs and the picture is the\n"
+                                   "                 upscaler's, unedited -- the same frame time\n"
+                                   "                 as the row below, which is what makes it\n"
+                                   "                 the useful one\n"
+                                   "  on, edit on    the full result");
 
                     ImGui::BeginDisabled(!config->NrEnabled.value_or_default());
 
