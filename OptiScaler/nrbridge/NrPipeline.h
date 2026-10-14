@@ -63,6 +63,13 @@ extern "C"
     // runs either way -- so it is an A/B of one frame, not of two.
     typedef int (*NrNetIntensity)(nr_net*, float);
     typedef int (*NrNetProfile)(nr_net*, int on);
+    // The submit's three costs, which the graph's own pass timings cannot see: the CPU
+    // handing the work over, the CPU waiting for it, and the read-back. The report reads
+    // twelve numbers -- frames, submit total/max, wait total/max, collect total/max, the
+    // mean of the three, then the staging transfers' total, slowest, calls, blocks -- and
+    // clears the span, so one report is one span of frames. (src/gpu/nr_net.h:127-142.)
+    typedef int (*NrNetTimeSubmit)(nr_net*, int on);
+    typedef int (*NrNetTimeReport)(nr_net*, double* out, unsigned cap);
     // Whether the recording really carries the two fused passes. nr_net_fuse is the
     // request and this is the answer: the walk decides while it runs, so a fuse that was
     // asked for is not necessarily a network that was fused.
@@ -212,6 +219,14 @@ class Pipeline
     // history weight over every fourth row. 0 on a frame with no history.
     float GateMean() const { return gateMean_; }
 
+    // The submit's three costs, split out of what RunFused measures as one wall-clock
+    // block: the CPU handing the graph over, the CPU waiting for the device, and the
+    // timestamp read-back. A diagnostic -- off until asked, and the report clears the
+    // span so each read covers only the frames since the last one. False where the
+    // library predates the calls.
+    bool TimeSubmit(bool on);
+    bool TimeReport(double out[12]);
+
   private:
     bool LoadLibraries(const std::filesystem::path& folder, std::string& why);
     void BuildTables();
@@ -245,6 +260,8 @@ class Pipeline
     NrNetExposure netExposure = nullptr;
     NrNetIntensity netIntensity = nullptr;
     NrNetProfile netProfile = nullptr;
+    NrNetTimeSubmit netTimeSubmit = nullptr;
+    NrNetTimeReport netTimeReport = nullptr;
     NrNetBoot netBoot = nullptr;
     NrNetHandle netInstance = nullptr, netPhysical = nullptr, netDevice = nullptr, netQueue = nullptr;
     NrNetFamily netFamily = nullptr;

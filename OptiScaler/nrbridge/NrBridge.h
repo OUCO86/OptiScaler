@@ -167,6 +167,10 @@ class Backend
     double LastFeaturesMs() const;
     double LastNetMs() const;
     double LastComposeMs() const;
+    // The network's submit split into its three costs -- the CPU handing the graph over,
+    // the CPU waiting for the device, the timestamp read-back -- over the frames since
+    // the last read (which clears the span). False where the library predates the calls.
+    bool SubmitTimings(double out[12]);
     // The same frame's three host-side parts: the colour out of the game's format, the
     // vectors out of theirs, and the answer back into the game's. Kept apart from the
     // network's own three because they are the host's work on the CPU, and a frame that is

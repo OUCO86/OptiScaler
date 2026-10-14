@@ -346,6 +346,8 @@ bool Pipeline::LoadLibraries(const std::filesystem::path& folder, std::string& w
     netExposure = reinterpret_cast<NrNetExposure>(GetProcAddress(net_, "nr_net_exposure"));
     netIntensity = reinterpret_cast<NrNetIntensity>(GetProcAddress(net_, "nr_net_intensity"));
     netProfile = reinterpret_cast<NrNetProfile>(GetProcAddress(net_, "nr_net_profile"));
+    netTimeSubmit = reinterpret_cast<NrNetTimeSubmit>(GetProcAddress(net_, "nr_net_time_submit"));
+    netTimeReport = reinterpret_cast<NrNetTimeReport>(GetProcAddress(net_, "nr_net_time_report"));
     netBoot = reinterpret_cast<NrNetBoot>(GetProcAddress(net_, "nr_net_boot"));
     netInstance = reinterpret_cast<NrNetHandle>(GetProcAddress(net_, "nr_net_instance"));
     netPhysical = reinterpret_cast<NrNetHandle>(GetProcAddress(net_, "nr_net_physical"));
@@ -656,6 +658,24 @@ bool Pipeline::RunFused(unsigned long long fence, unsigned long long value, std:
     }
     netMs_ = ElapsedMs(started);
     return true;
+}
+
+// The submit's three costs. The library keeps them until asked: turning them on is
+// three clock reads a frame, which is not what a game should pay for a diagnostic, so
+// the bridge asks once the network is up and reads the span every fiftieth frame.
+// The report clears the counters, so each read covers the frames since the last one.
+bool Pipeline::TimeSubmit(bool on)
+{
+    if (net == nullptr || netTimeSubmit == nullptr)
+        return false;
+    return netTimeSubmit(net, on ? 1 : 0) == 0;
+}
+
+bool Pipeline::TimeReport(double out[12])
+{
+    if (net == nullptr || netTimeReport == nullptr || out == nullptr)
+        return false;
+    return netTimeReport(net, out, 12u) >= 0;
 }
 
 bool Pipeline::Run(const float* colour, const float* motion, float* output, bool reproject, std::string& why)

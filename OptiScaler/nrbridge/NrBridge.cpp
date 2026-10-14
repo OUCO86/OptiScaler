@@ -882,6 +882,24 @@ int32_t EnqueueGap(void* session, void* job, void* command_queue)
                  host != nullptr ? host->LastMotionMs() : 0.0, host != nullptr ? host->LastFeaturesMs() : 0.0,
                  host != nullptr ? host->LastNetMs() : 0.0, host != nullptr ? host->LastComposeMs() : 0.0,
                  host != nullptr ? host->LastEncodeMs() : 0.0, hostMs);
+
+        // The graph's own split, read at the same cadence because the read clears the
+        // span: fifty frames of submit/wait/collect averaged into one line is the number
+        // the decision needs, and reading anywhere else would steal frames from the line
+        // that prints them. The three are the parts of the one `work`/`net` block above:
+        // the CPU handing the graph over, the CPU blocked in vkWaitForFences, and the
+        // timestamp read-back -- plus the staging transfers in front of it (the frame's
+        // exposure), which the submit's three do not include.
+        double t[12] {};
+        if (host != nullptr && host->SubmitTimings(t) && t[0] > 0.0)
+        {
+            const double frames = t[0];
+            LOG_INFO("NrBridge gap graph #{}: over {:.0f} submits | submit={:.3f} wait={:.3f} "
+                     "collect={:.3f} mean={:.3f} ms/frame | max {:.3f}/{:.3f}/{:.3f} | "
+                     "stage={:.3f}ms total, slowest {:.3f}, {:.0f} calls",
+                     run, frames, t[1] / frames, t[3] / frames, t[5] / frames, t[7],
+                     t[2], t[4], t[6], t[8], t[9], t[10]);
+        }
     }
 
     return 0;
@@ -1424,6 +1442,16 @@ bool Backend::Impl::EnsureNetwork(UINT w, UINT h)
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     LOG_INFO("NrBridge: network up in {:.0f} ms on {}x{} (field {}x{}) from {}", ms, w, h, network.NetWidth(),
              network.NetHeight(), NrFolder().string());
+
+    // The submit's three costs, asked for the moment the network is up. The gap's own
+    // timings see the whole of `work` as one block; these split it into the CPU handing
+    // the graph over, the CPU waiting for the device, and the timestamp read-back --
+    // which is what tells a frame slow on the device from a frame slow in the host's
+    // waiting (src/gpu/nr_net.h:127-142). Three clock reads a frame is a diagnostic's
+    // price, paid while the structure is being measured; the report clears the span, so
+    // the gap log reads it every fiftieth frame.
+    if (!network.TimeSubmit(true))
+        LOG_INFO("NrBridge: this network library does not offer the submit timings");
     return true;
 }
 
@@ -2049,6 +2077,7 @@ const char* Backend::NetworkFailure() const { return p->networkFailure.c_str(); 
 double Backend::LastFeaturesMs() const { return p->lastFeaturesMs; }
 double Backend::LastNetMs() const { return p->lastNetMs; }
 double Backend::LastComposeMs() const { return p->lastComposeMs; }
+bool Backend::SubmitTimings(double out[12]) { return p->network.TimeReport(out); }
 double Backend::LastDecodeMs() const { return p->lastDecodeMs; }
 double Backend::LastMotionMs() const { return p->lastMotionMs; }
 double Backend::LastEncodeMs() const { return p->lastEncodeMs; }
